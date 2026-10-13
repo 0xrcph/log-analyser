@@ -18,6 +18,7 @@ Usage:  python log_analyser.py sample_logs/auth.log
 
 import argparse
 import csv
+import html
 import json
 import ipaddress
 import os
@@ -55,9 +56,16 @@ def section(title, colour):
 # ------------------------------------------------------------------- parsing
 # This pattern pulls the useful parts out of each log line.
 LINE_PATTERN = re.compile(
-    r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) .*?"
-    r"(?P<result>Accepted|Failed) password for (?P<user>\S+) from (?P<ip>\S+)"
+    r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|[A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2}) .*?"
+    r"(?P<result>Accepted|Failed) (?:password|publickey) for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+)"
 )
+
+
+def parse_time(text, year):
+    """Parse '2025-10-03 02:14:05' (ISO) or classic syslog 'Oct  3 02:14:05' (no year, so `year` is used)."""
+    if text[0].isdigit():
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    return datetime.strptime(f"{year} {' '.join(text.split())}", "%Y %b %d %H:%M:%S")
 
 
 def parse_windows_csv(path):
@@ -80,22 +88,34 @@ def parse_windows_csv(path):
     return events
 
 
-def parse_log(path, log_format="auto"):
+def parse_log(path, log_format="auto", year=None):
     """Pick the right parser. 'auto' guesses from the file extension (.csv = Windows)."""
     if log_format == "windows" or (log_format == "auto" and path.lower().endswith(".csv")):
         return parse_windows_csv(path)
-    return parse_ssh_log(path)
+    return parse_ssh_log(path, year)
 
 
-def parse_ssh_log(path):
-    """Read an SSH-style log and return a list of events (dicts). Unreadable lines are skipped."""
+def parse_ssh_log(path, year=None):
+    """Read an SSH log (ISO or classic syslog timestamps) and return a list of events (dicts).
+
+    Syslog lines carry no year, so `year` (default: this year) is assumed. A date that would
+    land in the future is moved back a year, which handles a log that spans New Year.
+    Unreadable lines are skipped.
+    """
+    year = year or datetime.now().year
     events = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             match = LINE_PATTERN.match(line)
             if match:
+                try:
+                    when = parse_time(match["time"], year)
+                except ValueError:
+                    continue  # e.g. 'Feb 29' in a non-leap year
+                if not match["time"][0].isdigit() and when > datetime.now() + timedelta(days=1):
+                    when = when.replace(year=when.year - 1)
                 events.append({
-                    "time": datetime.strptime(match["time"], "%Y-%m-%d %H:%M:%S"),
+                    "time": when,
                     "success": match["result"] == "Accepted",
                     "user": match["user"],
                     "ip": match["ip"],
@@ -386,6 +406,43 @@ def export_markdown(path, source, events, alerts):
     print(f"{GREEN}✔ Saved Markdown report to {path}{RESET}")
 
 
+def export_html(path, source, events, alerts):
+    """Write a self-contained HTML report (no external files, so it can be emailed as is)."""
+    esc = html.escape
+    successes = sum(e["success"] for e in events)
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    rows = "".join(
+        f'<tr class="{esc(a["severity"].lower())}"><td>{esc(a["severity"])}</td><td>{esc(a["type"])}</td>'
+        f'<td>{esc(a["ip"])}</td><td>{esc(a["user"])}</td><td>{esc(a["time"])}</td><td>{esc(a["details"])}</td></tr>'
+        for a in sorted(alerts, key=lambda a: (order.get(a["severity"], 9), a["time"])))
+    table = (f"<table><tr><th>Severity</th><th>Type</th><th>IP</th><th>User</th><th>Time</th><th>Details</th></tr>{rows}</table>"
+             if alerts else "<p>No alerts.</p>")
+
+    def items(pairs):
+        return "<ul>" + "".join(f"<li><code>{esc(k)}</code>: {n} failed login(s)</li>" for k, n in pairs) + "</ul>" if pairs else "<p>None.</p>"
+
+    span = f"{events[0]['time']:%Y-%m-%d %H:%M} to {events[-1]['time']:%Y-%m-%d %H:%M}" if events else "n/a"
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login Log Analysis</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:2rem auto;max-width:960px;padding:0 1rem;color:#1a1a1a}}
+table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ccc;padding:.4rem .6rem;text-align:left;font-size:.9rem}}
+th{{background:#f0f0f0}} tr.critical td:first-child{{background:#f8d7da;font-weight:bold}}
+tr.high td:first-child{{background:#fde5c8}} tr.medium td:first-child{{background:#fff3cd}} tr.low td:first-child{{background:#e2f0d9}}
+</style></head><body>
+<h1>Login Log Analysis</h1>
+<p><strong>File:</strong> <code>{esc(source)}</code><br><strong>Events analysed:</strong> {len(events)} ({successes} successful, {len(events) - successes} failed)<br><strong>Time range:</strong> {esc(span)}</p>
+<h2>Alerts ({len(alerts)})</h2>{table}
+<h2>Most targeted accounts</h2>{items(top_targeted_users(events))}
+<h2>Noisiest source IPs</h2>{items(top_source_ips(events))}
+</body></html>
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(f"{GREEN}✔ Saved HTML report to {path}{RESET}")
+
+
 # ------------------------------------------------------------------- report
 def severity(count):
     """Turn a failure count into a label and colour."""
@@ -535,6 +592,8 @@ def main():
     parser.add_argument("--privileged", default="root,admin,administrator", metavar="NAMES",
                         help="comma-separated privileged account names to watch (default root,admin,administrator)")
     parser.add_argument("--markdown", metavar="FILE", help="also save a Markdown report to this file")
+    parser.add_argument("--html", metavar="FILE", help="also save a self-contained HTML report to this file")
+    parser.add_argument("--year", type=int, help="year to assume for syslog timestamps that have none (default: this year)")
     parser.add_argument("--fail-on-alert", action="store_true",
                         help="exit with code 1 on any alert and 2 on a possible compromise (for scripts/CI)")
     parser.add_argument("--json", metavar="FILE", help="also save the alerts to a JSON file")
@@ -542,7 +601,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        events = parse_log(args.logfile, args.format)
+        events = parse_log(args.logfile, args.format, args.year)
     except FileNotFoundError:
         sys.exit(f"Error: file not found: {args.logfile}")
     except (KeyError, ValueError):
@@ -565,6 +624,8 @@ def main():
     export_alerts(alerts, args.json, args.csv)
     if args.markdown:
         export_markdown(args.markdown, args.logfile, events, alerts)
+    if args.html:
+        export_html(args.html, args.logfile, events, alerts)
     if args.fail_on_alert:
         if compromises:
             sys.exit(2)

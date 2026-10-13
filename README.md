@@ -6,7 +6,7 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 
 ## Features
 
-- Parses **SSH-style auth logs** and **Windows Security event logs** (CSV export)
+- Parses **SSH auth logs** (ISO or real `/var/log/auth.log` syslog timestamps, `invalid user` and public-key logins) and **Windows Security event logs** (CSV export)
 - Sliding-window brute-force detection (configurable threshold and window)
 - Unusual-hour login detection, either fixed night hours or **learned per-user normal hours** (`--learn`)
 - Correlates events: flags a successful login that follows a brute-force burst from the same IP
@@ -16,7 +16,7 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 - **Privileged-login detection**: root/admin logins from an IP that had already failed (`--privileged`)
 - **Noisiest source IPs** ranking, including IPs below the brute-force threshold
 - Optional **GeoIP lookup** of attacking IPs (`--geoip`)
-- **JSON, CSV and Markdown export** of all alerts, plus `--top N` to focus on the worst offenders
+- **JSON, CSV, Markdown and self-contained HTML export** of all alerts, plus `--top N` to focus on the worst offenders
 - Severity labels, a mini bar chart and a final summary with recommended actions
 - Pure Python 3 standard library, with nothing to install
 
@@ -25,6 +25,7 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 ```
 log-analyser/
 ├── log_analyser.py          # the analyser (main tool)
+├── test_log_analyser.py     # unit tests (python -m unittest)
 ├── generate_sample_logs.py  # creates realistic fake logs for testing
 ├── sample_logs/auth.log              # generated SSH sample data
 ├── sample_logs/windows_security.csv  # generated Windows sample data
@@ -61,6 +62,8 @@ python log_analyser.py sample_logs/auth.log
 | `--json FILE` | none | Also save all alerts to a JSON file |
 | `--csv FILE` | none | Also save all alerts to a CSV file |
 | `--markdown FILE` | none | Also save a Markdown report (alerts table, top accounts and IPs) |
+| `--html FILE` | none | Also save a self-contained HTML report with a colour-coded alerts table |
+| `--year YYYY` | this year | Year to assume for syslog timestamps (`Oct  3 02:14:05`), which carry none |
 | `--privileged NAMES` | `root,admin,administrator` | Comma-separated privileged accounts to watch for logins from IPs that failed first |
 | `--format` | `auto` | `ssh` or `windows`; `auto` treats `.csv` files as Windows |
 
@@ -159,7 +162,7 @@ All IPs are from reserved documentation ranges (RFC 5737), so none belong to rea
 - Two log formats only; add parsers for web server logs, firewall logs or the raw `.evtx` format
 - `--learn` is a simple heuristic and needs a few logins per user; a real system would use longer baselines
 - GeoIP uses one free service; threat-intelligence reputation lookups (e.g. AbuseIPDB) would add context
-- Could also export an HTML report or send alerts by email (Markdown export already exists)
+- Could also send alerts by email or webhook (JSON, CSV, Markdown and HTML export already exist)
 
 ## Disclaimer
 
