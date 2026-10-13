@@ -13,8 +13,10 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 - **Password-spraying detection**: one IP failing against many different accounts
 - **Most-targeted accounts** ranking and an **hourly histogram** of failed logins
 - **Allow-list** (`--allow`), **date filters** (`--since`/`--until`) and a **CI-friendly exit code** (`--fail-on-alert`)
+- **Privileged-login detection**: root/admin logins from an IP that had already failed (`--privileged`)
+- **Noisiest source IPs** ranking, including IPs below the brute-force threshold
 - Optional **GeoIP lookup** of attacking IPs (`--geoip`)
-- **JSON and CSV export** of all alerts, plus `--top N` to focus on the worst offenders
+- **JSON, CSV and Markdown export** of all alerts, plus `--top N` to focus on the worst offenders
 - Severity labels, a mini bar chart and a final summary with recommended actions
 - Pure Python 3 standard library, with nothing to install
 
@@ -58,6 +60,8 @@ python log_analyser.py sample_logs/auth.log
 | `--fail-on-alert` | off | Exit code 1 if any alert, 2 if a possible compromise (for scripts/CI) |
 | `--json FILE` | none | Also save all alerts to a JSON file |
 | `--csv FILE` | none | Also save all alerts to a CSV file |
+| `--markdown FILE` | none | Also save a Markdown report (alerts table, top accounts and IPs) |
+| `--privileged NAMES` | `root,admin,administrator` | Comma-separated privileged accounts to watch for logins from IPs that failed first |
 | `--format` | `auto` | `ssh` or `windows`; `auto` treats `.csv` files as Windows |
 
 Examples:
@@ -129,6 +133,11 @@ python log_analyser.py security.csv
 
 **Why it matters:** This is the most serious finding, because it suggests the attacker **got in**. It turns "someone is attacking us" into "someone may be inside", which is when you reset credentials, investigate and respond to an incident.
 
+### 5. Privileged logins after failures
+**What:** A successful login to a privileged account (`root`, `admin`, `administrator` by default) from an IP that had already failed to log in earlier in the log. Logins already flagged as a possible compromise are not repeated.
+
+**Why it matters:** Privileged accounts give an attacker full control, so a login that follows failed attempts (typos from a real admin, or guessing by an attacker) deserves a quick check. It is a lower-severity hint than the compromise rule, which needs a full brute-force burst first.
+
 ## About the sample data
 
 `generate_sample_logs.py` builds three days of fake traffic with a fixed random seed, so the results are repeatable. `auth.log` contains:
@@ -150,7 +159,7 @@ All IPs are from reserved documentation ranges (RFC 5737), so none belong to rea
 - Two log formats only; add parsers for web server logs, firewall logs or the raw `.evtx` format
 - `--learn` is a simple heuristic and needs a few logins per user; a real system would use longer baselines
 - GeoIP uses one free service; threat-intelligence reputation lookups (e.g. AbuseIPDB) would add context
-- Could also export an HTML report or send alerts by email
+- Could also export an HTML report or send alerts by email (Markdown export already exists)
 
 ## Disclaimer
 

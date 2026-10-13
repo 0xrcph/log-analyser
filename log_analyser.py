@@ -5,12 +5,14 @@ It reads an SSH-style auth log and looks for:
   2. Unusual-hour logins   - successful logins late at night / early morning
   3. Possible compromise   - a successful login right after a brute-force burst
   4. Password spraying     - one IP trying many different accounts in a short time
-  5. Targeted accounts and an hourly histogram of failed logins
+  5. Targeted accounts, noisiest source IPs and an hourly histogram of failed logins
+  6. Privileged logins - root/admin accounts logged into from an IP that failed first
 
 Usage:  python log_analyser.py sample_logs/auth.log
         python log_analyser.py sample_logs/windows_security.csv
         python log_analyser.py auth.log --learn --geoip --top 3 --json out.json --csv out.csv
         python log_analyser.py auth.log --allow 10.0.0.0/8 --since 2025-01-01 --spray-users 4 --fail-on-alert
+        python log_analyser.py auth.log --privileged root --markdown report.md
         python log_analyser.py auth.log --threshold 5 --window 5 --night-start 0 --night-end 6
 """
 
@@ -181,6 +183,15 @@ def top_targeted_users(events, limit=5):
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
+def top_source_ips(events, limit=5):
+    """Rank source IPs by total failed logins (even below the brute-force threshold)."""
+    counts = defaultdict(int)
+    for e in events:
+        if not e["success"]:
+            counts[e["ip"]] += 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+
 def failures_by_hour(events):
     """Count failed logins for each hour of the day (list of 24 numbers)."""
     counts = [0] * 24
@@ -263,6 +274,24 @@ def find_compromises(events, brute_force):
     return hits
 
 
+def find_privileged_logins(events, privileged, compromises):
+    """Successful logins to privileged accounts from an IP that had already failed.
+
+    Logins already reported as a possible compromise are skipped so nothing is
+    counted twice. Account names are compared case-insensitively.
+    """
+    names = {p.lower() for p in privileged}
+    already = {id(e) for e in compromises}
+    failed_ips = set()
+    hits = []
+    for e in events:  # events are time-sorted, so "already failed" means earlier in the log
+        if not e["success"]:
+            failed_ips.add(e["ip"])
+        elif e["user"].lower() in names and e["ip"] in failed_ips and id(e) not in already:
+            hits.append(e)
+    return hits
+
+
 # -------------------------------------------------------------------- geoip
 def lookup_ip(ip):
     """Look up where an IP is (country, city, ISP) using the free ip-api.com service.
@@ -293,7 +322,7 @@ def add_locations(brute_force):
 
 
 # -------------------------------------------------------------------- export
-def build_alerts(brute_force, compromises, odd_hours, spray=None):
+def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None):
     """Flatten every finding into a simple list of dicts (easy to save as JSON/CSV)."""
     alerts = []
     for ip, b in brute_force.items():
@@ -307,6 +336,10 @@ def build_alerts(brute_force, compromises, odd_hours, spray=None):
     for e in compromises:
         alerts.append({"type": "possible_compromise", "severity": "CRITICAL", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "), "details": "successful login after brute-force burst"})
+    for e in privileged or []:
+        alerts.append({"type": "privileged_login", "severity": "MEDIUM", "ip": e["ip"], "user": e["user"],
+                       "time": e["time"].isoformat(sep=" "),
+                       "details": "privileged account login from an IP with earlier failures"})
     for e in odd_hours:
         alerts.append({"type": "unusual_hour_login", "severity": "LOW", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "), "details": "login outside normal hours"})
@@ -327,6 +360,32 @@ def export_alerts(alerts, json_path, csv_path):
         print(f"{GREEN}✔ Saved {len(alerts)} alert(s) to {csv_path}{RESET}")
 
 
+def export_markdown(path, source, events, alerts):
+    """Write a short Markdown report (handy to paste into a ticket or share with a team)."""
+    successes = sum(e["success"] for e in events)
+    lines = ["# Login Log Analysis", "",
+             f"- **File:** `{source}`",
+             f"- **Events analysed:** {len(events)} ({successes} successful, {len(events) - successes} failed)"]
+    if events:
+        lines.append(f"- **Time range:** {events[0]['time']:%Y-%m-%d %H:%M} to {events[-1]['time']:%Y-%m-%d %H:%M}")
+    lines += ["", f"## Alerts ({len(alerts)})", ""]
+    if alerts:
+        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        lines += ["| Severity | Type | IP | User | Time | Details |", "|---|---|---|---|---|---|"]
+        for a in sorted(alerts, key=lambda a: (order.get(a["severity"], 9), a["time"])):
+            cells = [a["severity"], a["type"], a["ip"], a["user"], a["time"], a["details"]]
+            lines.append("| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |")
+    else:
+        lines.append("No alerts.")
+    lines += ["", "## Most targeted accounts", ""]
+    lines += [f"- `{u}`: {n} failed login(s)" for u, n in top_targeted_users(events)] or ["None."]
+    lines += ["", "## Noisiest source IPs", ""]
+    lines += [f"- `{ip}`: {n} failed login(s)" for ip, n in top_source_ips(events)] or ["None."]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"{GREEN}✔ Saved Markdown report to {path}{RESET}")
+
+
 # ------------------------------------------------------------------- report
 def severity(count):
     """Turn a failure count into a label and colour."""
@@ -343,8 +402,9 @@ def bar(count, biggest, length=20):
     return "█" * filled + "░" * (length - filled)
 
 
-def print_report(path, events, brute_force, odd_hours, compromises, args, spray=None):
+def print_report(path, events, brute_force, odd_hours, compromises, args, spray=None, privileged=None):
     spray = spray or {}
+    privileged = privileged or []
     banner("LOGIN LOG ANALYSER")
     successes = sum(e["success"] for e in events)
     print(f"{DIM}File:{RESET} {path}")
@@ -393,6 +453,14 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
     else:
         print(f"{GREEN}✔ No successful logins from brute-forcing IPs.{RESET}")
 
+    # --- Privileged logins
+    section(f"PRIVILEGED ACCOUNT LOGINS AFTER FAILURES  ({len(privileged)})", YELLOW)
+    if privileged:
+        for e in privileged:
+            print(f"{YELLOW}●{RESET} {e['time']:%Y-%m-%d %H:%M:%S}  {BOLD}{e['user']:<14}{RESET} from {e['ip']}")
+    else:
+        print(f"{GREEN}✔ No privileged logins from IPs that failed first.{RESET}")
+
     # --- Unusual hours
     section(f"UNUSUAL-HOUR LOGINS  ({len(odd_hours)})", YELLOW)
     if odd_hours:
@@ -410,6 +478,15 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
     else:
         print(f"{GREEN}✔ No failed logins.{RESET}")
 
+    # --- Noisiest source IPs
+    section("NOISIEST SOURCE IPs", CYAN)
+    sources = top_source_ips(events)
+    if sources:
+        for ip, count in sources:
+            print(f"{BOLD}{ip:<18}{RESET} {RED}{bar(count, sources[0][1], 16)}{RESET} {count} failed login(s)")
+    else:
+        print(f"{GREEN}✔ No failed logins.{RESET}")
+
     # --- Hourly histogram
     section("FAILED LOGINS BY HOUR", CYAN)
     hourly = failures_by_hour(events)
@@ -422,11 +499,11 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
 
     # --- Summary
     section("SUMMARY", CYAN)
-    total_alerts = len(brute_force) + len(spray) + len(compromises) + len(odd_hours)
+    total_alerts = len(brute_force) + len(spray) + len(compromises) + len(odd_hours) + len(privileged)
     colour = RED if compromises else YELLOW if total_alerts else GREEN
     print(f"{colour}{BOLD}{total_alerts} alert(s){RESET}: {len(brute_force)} brute-force source(s), "
           f"{len(spray)} spraying source(s), {len(compromises)} possible compromise(s), "
-          f"{len(odd_hours)} unusual-hour login(s)")
+          f"{len(odd_hours)} unusual-hour login(s), {len(privileged)} privileged login(s)")
     if compromises:
         print(f"{RED}Action:{RESET} reset the affected account(s), review what they did, and block the source IP(s).")
     elif brute_force or spray:
@@ -455,6 +532,9 @@ def main():
                         help="ignore events from this IP or network (repeatable, e.g. --allow 10.0.0.0/8)")
     parser.add_argument("--since", type=parse_date, metavar="YYYY-MM-DD", help="ignore events before this date")
     parser.add_argument("--until", type=parse_date, metavar="YYYY-MM-DD", help="ignore events after this date (inclusive)")
+    parser.add_argument("--privileged", default="root,admin,administrator", metavar="NAMES",
+                        help="comma-separated privileged account names to watch (default root,admin,administrator)")
+    parser.add_argument("--markdown", metavar="FILE", help="also save a Markdown report to this file")
     parser.add_argument("--fail-on-alert", action="store_true",
                         help="exit with code 1 on any alert and 2 on a possible compromise (for scripts/CI)")
     parser.add_argument("--json", metavar="FILE", help="also save the alerts to a JSON file")
@@ -477,14 +557,18 @@ def main():
         odd_hours = find_unusual_hours(events, args.night_start, args.night_end)
     compromises = find_compromises(events, brute_force)
     spray = find_password_spray(events, args.spray_users, args.window)
+    privileged = find_privileged_logins(events, [n.strip() for n in args.privileged.split(",") if n.strip()], compromises)
     if args.geoip:
         add_locations(brute_force)
-    print_report(args.logfile, events, brute_force, odd_hours, compromises, args, spray)
-    export_alerts(build_alerts(brute_force, compromises, odd_hours, spray), args.json, args.csv)
+    print_report(args.logfile, events, brute_force, odd_hours, compromises, args, spray, privileged)
+    alerts = build_alerts(brute_force, compromises, odd_hours, spray, privileged)
+    export_alerts(alerts, args.json, args.csv)
+    if args.markdown:
+        export_markdown(args.markdown, args.logfile, events, alerts)
     if args.fail_on_alert:
         if compromises:
             sys.exit(2)
-        if brute_force or spray or odd_hours:
+        if brute_force or spray or odd_hours or privileged:
             sys.exit(1)
 
 
