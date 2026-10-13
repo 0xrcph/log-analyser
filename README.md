@@ -14,6 +14,9 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 - **Most-targeted accounts** ranking and an **hourly histogram** of failed logins
 - **Allow-list** (`--allow`), **date filters** (`--since`/`--until`) and a **CI-friendly exit code** (`--fail-on-alert`)
 - **Privileged-login detection**: root/admin logins from an IP that had already failed (`--privileged`)
+- **Distributed-attack detection**: many IPs sharing the work of attacking one account (`--dist-ips`)
+- **Per-IP risk score (0-100)** that combines every signal from the same source
+- **Config file** (`--config`) so a team can share one set of rules
 - **Noisiest source IPs** ranking, including IPs below the brute-force threshold
 - Optional **GeoIP lookup** of attacking IPs (`--geoip`)
 - **JSON, CSV, Markdown and self-contained HTML export** of all alerts, plus `--top N` to focus on the worst offenders
@@ -62,6 +65,8 @@ python log_analyser.py sample_logs/auth.log
 | `--json FILE` | none | Also save all alerts to a JSON file |
 | `--csv FILE` | none | Also save all alerts to a CSV file |
 | `--markdown FILE` | none | Also save a Markdown report (alerts table, top accounts and IPs) |
+| `--dist-ips N` | `5` | Distinct IPs failing against one account (within `--window`) needed to flag a distributed attack |
+| `--config FILE` | none | JSON file of default options (see below); command-line flags override it |
 | `--html FILE` | none | Also save a self-contained HTML report with a colour-coded alerts table |
 | `--year YYYY` | this year | Year to assume for syslog timestamps (`Oct  3 02:14:05`), which carry none |
 | `--privileged NAMES` | `root,admin,administrator` | Comma-separated privileged accounts to watch for logins from IPs that failed first |
@@ -78,6 +83,26 @@ python log_analyser.py sample_logs/windows_security.csv
 
 # Learned hours, top 3 attackers, save results
 python log_analyser.py sample_logs/auth.log --learn --top 3 --json alerts.json --csv alerts.csv
+```
+
+### Config file
+
+Keys are the long option names with underscores. Unknown keys are rejected so typos don't pass silently.
+
+```json
+{
+  "threshold": 3,
+  "window": 2,
+  "night_start": 22,
+  "night_end": 6,
+  "allow": ["10.0.0.0/8", "192.168.0.0/16"],
+  "privileged": "root,admin,administrator,postgres",
+  "fail_on_alert": true
+}
+```
+
+```bash
+python log_analyser.py auth.log --config analyser.json --html report.html
 ```
 
 ### `--learn` vs fixed night hours
@@ -140,6 +165,16 @@ python log_analyser.py security.csv
 **What:** A successful login to a privileged account (`root`, `admin`, `administrator` by default) from an IP that had already failed to log in earlier in the log. Logins already flagged as a possible compromise are not repeated.
 
 **Why it matters:** Privileged accounts give an attacker full control, so a login that follows failed attempts (typos from a real admin, or guessing by an attacker) deserves a quick check. It is a lower-severity hint than the compromise rule, which needs a full brute-force burst first.
+
+### 6. Distributed attacks
+**What:** One account failing from several *different* IPs inside the window (default: 5 or more IPs).
+
+**Why it matters:** A botnet can split a guessing run across many addresses so that no single IP crosses the brute-force threshold. Grouping by target account exposes it. Blocking one IP won't help, so consider lockouts, MFA or geo-restrictions on that account. (The sample logs don't contain this pattern; the unit tests cover it.)
+
+### 7. IP risk score
+**What:** Every alert is worth points by severity (CRITICAL 40, HIGH 20, MEDIUM 10, LOW 3). Points add up per source IP, capped at 100.
+
+**Why it matters:** One IP that brute-forces, sprays *and* logs in successfully is far more urgent than one that only logged in at an odd hour. The ranking tells you which IP to deal with first.
 
 ## About the sample data
 

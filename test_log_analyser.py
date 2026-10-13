@@ -82,6 +82,76 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(la.top_source_ips(events)[0], ("1.1.1.1", 2))
 
 
+class AdvancedTests(unittest.TestCase):
+    def test_distributed_attack_many_ips_one_account(self):
+        events = [ev(i, False, user="admin", ip=f"203.0.113.{i}") for i in range(5)]
+        found = la.find_distributed_attack(events, 5, 5)
+        self.assertEqual(found["admin"]["ip_count"], 5)
+        self.assertEqual(la.find_distributed_attack(events[:4], 5, 5), {})
+        self.assertEqual(la.find_brute_force(events, 5, 5), {})  # no single IP is loud enough
+
+    def test_distributed_alert_is_built(self):
+        events = [ev(i, False, user="admin", ip=f"203.0.113.{i}") for i in range(5)]
+        dist = la.find_distributed_attack(events, 5, 5)
+        alerts = la.build_alerts({}, [], [], None, None, dist)
+        self.assertEqual(alerts[0]["type"], "distributed_attack")
+
+    def test_risk_scores_add_up_and_skip_non_ips(self):
+        alerts = [
+            {"severity": "CRITICAL", "type": "brute_force", "ip": "1.1.1.1"},
+            {"severity": "HIGH", "type": "password_spray", "ip": "1.1.1.1"},
+            {"severity": "LOW", "type": "unusual_hour_login", "ip": "2.2.2.2"},
+            {"severity": "HIGH", "type": "distributed_attack", "ip": "multiple (5 IPs)"},
+        ]
+        scores = la.risk_scores(alerts)
+        self.assertEqual(scores[0], ("1.1.1.1", 60, ["brute_force", "password_spray"]))
+        self.assertEqual([s[0] for s in scores], ["1.1.1.1", "2.2.2.2"])
+
+    def test_risk_score_is_capped(self):
+        alerts = [{"severity": "CRITICAL", "type": f"t{i}", "ip": "1.1.1.1"} for i in range(5)]
+        self.assertEqual(la.risk_scores(alerts)[0][1], 100)
+
+    def test_config_file_sets_defaults_and_cli_wins(self):
+        import argparse
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"threshold": 3, "since": "2025-01-02", "allow": ["10.0.0.0/8"]}')
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--config")
+            parser.add_argument("--threshold", type=int, default=5)
+            parser.add_argument("--since", type=la.parse_date)
+            parser.add_argument("--allow", action="append", default=[])
+            old = sys.argv
+            try:
+                sys.argv = ["x", "--config", path]
+                la.apply_config(parser)
+                args = parser.parse_args(["--threshold", "9"])
+            finally:
+                sys.argv = old
+        self.assertEqual(args.threshold, 9)
+        self.assertEqual(args.since, datetime(2025, 1, 2))
+        self.assertEqual(args.allow, ["10.0.0.0/8"])
+
+    def test_config_rejects_unknown_key(self):
+        import argparse
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"nonsense": 1}')
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--config")
+            old = sys.argv
+            try:
+                sys.argv = ["x", "--config", path]
+                with self.assertRaises(SystemExit):
+                    la.apply_config(parser)
+            finally:
+                sys.argv = old
+
+
 class ExportTests(unittest.TestCase):
     def test_html_report_escapes_input(self):
         events = [ev(0, False, user="<script>")]

@@ -7,12 +7,15 @@ It reads an SSH-style auth log and looks for:
   4. Password spraying     - one IP trying many different accounts in a short time
   5. Targeted accounts, noisiest source IPs and an hourly histogram of failed logins
   6. Privileged logins - root/admin accounts logged into from an IP that failed first
+  7. Distributed attacks - many IPs sharing the work of attacking one account
+  8. A combined 0-100 risk score per source IP
 
 Usage:  python log_analyser.py sample_logs/auth.log
         python log_analyser.py sample_logs/windows_security.csv
         python log_analyser.py auth.log --learn --geoip --top 3 --json out.json --csv out.csv
         python log_analyser.py auth.log --allow 10.0.0.0/8 --since 2025-01-01 --spray-users 4 --fail-on-alert
         python log_analyser.py auth.log --privileged root --markdown report.md
+        python log_analyser.py auth.log --config analyser.json --html report.html
         python log_analyser.py auth.log --threshold 5 --window 5 --night-start 0 --night-end 6
 """
 
@@ -194,6 +197,62 @@ def find_password_spray(events, min_users, window_minutes):
     return results
 
 
+def find_distributed_attack(events, min_ips, window_minutes):
+    """Find accounts failed from `min_ips` or more different IPs inside one window.
+
+    This is the mirror image of spraying: a botnet shares the work so that no single
+    IP trips the per-IP brute-force rule. Returns user -> info about the widest burst.
+    """
+    window = timedelta(minutes=window_minutes)
+    failures_by_user = defaultdict(list)
+    for e in events:
+        if not e["success"]:
+            failures_by_user[e["user"]].append(e)
+
+    results = {}
+    for user, fails in failures_by_user.items():
+        fails.sort(key=lambda e: e["time"])
+        start = 0
+        best = None  # (distinct ips, first_event, last_event)
+        for end in range(len(fails)):
+            while fails[end]["time"] - fails[start]["time"] > window:
+                start += 1
+            ips = {e["ip"] for e in fails[start:end + 1]}
+            if len(ips) >= min_ips and (best is None or len(ips) > best[0]):
+                best = (len(ips), fails[start], fails[end])
+        if best:
+            burst = [e for e in fails if best[1]["time"] <= e["time"] <= best[2]["time"]]
+            results[user] = {
+                "ip_count": best[0],
+                "first": best[1]["time"],
+                "last": best[2]["time"],
+                "ips": sorted({e["ip"] for e in burst}),
+                "attempts": len(burst),
+            }
+    return results
+
+
+RISK_WEIGHTS = {"CRITICAL": 40, "HIGH": 20, "MEDIUM": 10, "LOW": 3}
+
+
+def risk_scores(alerts, limit=5):
+    """Combine all alerts per source IP into one 0-100 score: [(ip, score, [alert types]), ...].
+
+    One loud signal is serious, but several different signals from the same IP are worse,
+    so scores add up (capped at 100). Alerts without a single IP (distributed attacks) are skipped.
+    """
+    total, kinds = defaultdict(int), defaultdict(set)
+    for a in alerts:
+        try:
+            ipaddress.ip_address(a["ip"])
+        except ValueError:
+            continue
+        total[a["ip"]] += RISK_WEIGHTS.get(a["severity"], 0)
+        kinds[a["ip"]].add(a["type"])
+    ranked = sorted(total, key=lambda ip: (-total[ip], ip))
+    return [(ip, min(100, total[ip]), sorted(kinds[ip])) for ip in ranked[:limit]]
+
+
 def top_targeted_users(events, limit=5):
     """Rank accounts by number of failed logins: [(user, failures), ...]."""
     counts = defaultdict(int)
@@ -342,7 +401,7 @@ def add_locations(brute_force):
 
 
 # -------------------------------------------------------------------- export
-def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None):
+def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None, distributed=None):
     """Flatten every finding into a simple list of dicts (easy to save as JSON/CSV)."""
     alerts = []
     for ip, b in brute_force.items():
@@ -356,6 +415,11 @@ def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=Non
     for e in compromises:
         alerts.append({"type": "possible_compromise", "severity": "CRITICAL", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "), "details": "successful login after brute-force burst"})
+    for user, d in (distributed or {}).items():
+        alerts.append({"type": "distributed_attack", "severity": "HIGH", "ip": f"multiple ({d['ip_count']} IPs)", "user": user,
+                       "time": d["first"].isoformat(sep=" "),
+                       "details": f"{d['attempts']} attempts from {d['ip_count']} IPs until {d['last']:%H:%M:%S}: "
+                                  + ", ".join(d["ips"])})
     for e in privileged or []:
         alerts.append({"type": "privileged_login", "severity": "MEDIUM", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "),
@@ -459,9 +523,11 @@ def bar(count, biggest, length=20):
     return "█" * filled + "░" * (length - filled)
 
 
-def print_report(path, events, brute_force, odd_hours, compromises, args, spray=None, privileged=None):
+def print_report(path, events, brute_force, odd_hours, compromises, args, spray=None, privileged=None,
+                 distributed=None, scores=None):
     spray = spray or {}
     privileged = privileged or []
+    distributed = distributed or {}
     banner("LOGIN LOG ANALYSER")
     successes = sum(e["success"] for e in events)
     print(f"{DIM}File:{RESET} {path}")
@@ -500,6 +566,17 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
             print(f"   {DIM}accounts targeted:{RESET} {', '.join(sp['users'])}")
     else:
         print(f"{GREEN}✔ No password-spraying detected.{RESET}")
+
+    # --- Distributed attacks
+    section(f"DISTRIBUTED ATTACKS ON ONE ACCOUNT  ({len(distributed)})", RED)
+    if distributed:
+        for user, d in sorted(distributed.items(), key=lambda kv: -kv[1]["ip_count"]):
+            print(f"{YELLOW}{BOLD}[HIGH]{RESET} {BOLD}{user}{RESET}")
+            print(f"   {d['attempts']} attempts from {d['ip_count']} different IPs "
+                  f"between {d['first']:%H:%M:%S} and {d['last']:%H:%M:%S} on {d['first']:%Y-%m-%d}")
+            print(f"   {DIM}source IPs:{RESET} {', '.join(d['ips'])}")
+    else:
+        print(f"{GREEN}✔ No distributed attacks on a single account.{RESET}")
 
     # --- Compromise
     section(f"POSSIBLE COMPROMISE  ({len(compromises)})", RED)
@@ -544,6 +621,15 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
     else:
         print(f"{GREEN}✔ No failed logins.{RESET}")
 
+    # --- Risk scores
+    section("IP RISK SCORES  (all signals combined, 0-100)", RED)
+    if scores:
+        for ip, score, kinds in scores:
+            colour = RED if score >= 60 else YELLOW if score >= 30 else GREEN
+            print(f"{BOLD}{ip:<18}{RESET} {colour}{bar(score, 100, 16)}{RESET} {score:>3}  {DIM}{', '.join(kinds)}{RESET}")
+    else:
+        print(f"{GREEN}✔ No IP triggered any alert.{RESET}")
+
     # --- Hourly histogram
     section("FAILED LOGINS BY HOUR", CYAN)
     hourly = failures_by_hour(events)
@@ -556,19 +642,56 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
 
     # --- Summary
     section("SUMMARY", CYAN)
-    total_alerts = len(brute_force) + len(spray) + len(compromises) + len(odd_hours) + len(privileged)
+    total_alerts = (len(brute_force) + len(spray) + len(compromises) + len(odd_hours)
+                    + len(privileged) + len(distributed))
     colour = RED if compromises else YELLOW if total_alerts else GREEN
     print(f"{colour}{BOLD}{total_alerts} alert(s){RESET}: {len(brute_force)} brute-force source(s), "
           f"{len(spray)} spraying source(s), {len(compromises)} possible compromise(s), "
-          f"{len(odd_hours)} unusual-hour login(s), {len(privileged)} privileged login(s)")
+          f"{len(odd_hours)} unusual-hour login(s), {len(privileged)} privileged login(s), "
+          f"{len(distributed)} distributed attack(s)")
     if compromises:
         print(f"{RED}Action:{RESET} reset the affected account(s), review what they did, and block the source IP(s).")
-    elif brute_force or spray:
+    elif brute_force or spray or distributed:
         print(f"{YELLOW}Action:{RESET} block the source IP(s) and consider rate-limiting or MFA.")
     print()
 
 
 # --------------------------------------------------------------------- main
+def apply_config(parser):
+    """If --config FILE was given, use its JSON keys as option defaults (CLI flags still win).
+
+    Keys are the long option names with underscores, e.g. "night_start" for --night-start.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    path = pre.parse_known_args()[0].config
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"Error: config file not found: {path}")
+    except json.JSONDecodeError as err:
+        sys.exit(f"Error: config file is not valid JSON: {err}")
+    if not isinstance(config, dict):
+        sys.exit("Error: config file must contain a JSON object")
+
+    actions = {a.dest: a for a in parser._actions if a.dest not in ("help", "logfile", "config")}
+    for key, value in config.items():
+        if key not in actions:
+            sys.exit(f"Error: unknown option in config file: {key} (valid: {', '.join(sorted(actions))})")
+        convert = actions[key].type
+        try:
+            if convert and isinstance(value, str):
+                value = convert(value)
+            elif convert and isinstance(value, list):
+                value = [convert(v) if isinstance(v, str) else v for v in value]
+        except (ValueError, argparse.ArgumentTypeError):
+            sys.exit(f"Error: bad value for '{key}' in config file: {value!r}")
+        parser.set_defaults(**{key: value})
+
+
 def main():
     parser = argparse.ArgumentParser(description="Detect brute-force and unusual-hour logins in an auth log.")
     parser.add_argument("logfile", help="path to the log file")
@@ -598,6 +721,11 @@ def main():
                         help="exit with code 1 on any alert and 2 on a possible compromise (for scripts/CI)")
     parser.add_argument("--json", metavar="FILE", help="also save the alerts to a JSON file")
     parser.add_argument("--csv", metavar="FILE", help="also save the alerts to a CSV file")
+    parser.add_argument("--config", metavar="FILE",
+                        help="JSON file of default options, e.g. {\"threshold\": 3, \"allow\": [\"10.0.0.0/8\"]}; command-line flags win")
+    parser.add_argument("--dist-ips", type=int, default=5,
+                        help="distinct IPs failing against one account within the window to flag a distributed attack (default 5)")
+    apply_config(parser)
     args = parser.parse_args()
 
     try:
@@ -619,8 +747,10 @@ def main():
     privileged = find_privileged_logins(events, [n.strip() for n in args.privileged.split(",") if n.strip()], compromises)
     if args.geoip:
         add_locations(brute_force)
-    print_report(args.logfile, events, brute_force, odd_hours, compromises, args, spray, privileged)
-    alerts = build_alerts(brute_force, compromises, odd_hours, spray, privileged)
+    distributed = find_distributed_attack(events, args.dist_ips, args.window)
+    alerts = build_alerts(brute_force, compromises, odd_hours, spray, privileged, distributed)
+    print_report(args.logfile, events, brute_force, odd_hours, compromises, args, spray, privileged,
+                 distributed, risk_scores(alerts))
     export_alerts(alerts, args.json, args.csv)
     if args.markdown:
         export_markdown(args.markdown, args.logfile, events, alerts)
@@ -629,7 +759,7 @@ def main():
     if args.fail_on_alert:
         if compromises:
             sys.exit(2)
-        if brute_force or spray or odd_hours or privileged:
+        if brute_force or spray or odd_hours or privileged or distributed:
             sys.exit(1)
 
 
