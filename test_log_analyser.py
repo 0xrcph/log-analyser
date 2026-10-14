@@ -628,7 +628,9 @@ class FollowTests(unittest.TestCase):
 
     def setup_log(self, text, *argv):
         """A temp log plus a Follower on it; both are cleaned up in the right order (file closed first)."""
-        directory = self.enterContext(tempfile.TemporaryDirectory())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)  # registered first, so it runs last (after the follower closes its file)
+        directory = tmp.name
         path = write_temp(directory, "auth.log", text)
         follower = la.Follower(path, make_args("--year", "2025", *argv))
         self.addCleanup(follower.close)
@@ -733,6 +735,71 @@ class OptionTests(unittest.TestCase):
             with open(block, encoding="utf-8") as f:
                 self.assertIn("iptables -I INPUT -s 203.0.113.99 -j DROP", f.read())
             self.assertTrue(os.path.getsize(page) > 1000)
+
+
+class RoundThreeTests(unittest.TestCase):
+    def feed(self, *lines):
+        parser, events, specials = la.SshParser(2025), [], []
+        for line in lines:
+            parser.feed(line + "\n", events, specials)
+        return events, specials
+
+    def test_journalctl_and_rfc3339_timestamps(self):
+        events, _ = self.feed(
+            "2025-10-01T10:00:00+0000 host sshd[1]: Failed password for root from 198.51.100.9 port 22 ssh2",
+            "2025-10-01T10:00:01.123456+02:00 host sshd[2]: Failed password for bob from 198.51.100.9 port 22 ssh2",
+            "2025-10-01T10:00:02Z host sshd[3]: Accepted publickey for bob from 198.51.100.9 port 22 ssh2")
+        self.assertEqual([e["time"].second for e in events], [0, 1, 2])
+        self.assertEqual(events[0]["time"].hour, 10)  # the zone suffix is ignored, the written time is kept
+
+    FW = ("2025-10-01 10:00:{s:02d} fw kernel: [UFW BLOCK] IN=eth0 OUT= SRC=203.0.113.9 DST=10.0.0.1 "
+          "LEN=44 PROTO=TCP SPT=4444 DPT={port} WINDOW=1024 SYN")
+
+    def test_firewall_lines_become_specials_not_logins(self):
+        events, specials = self.feed(self.FW.format(s=0, port=22), "Oct  3 02:14:05 h kernel: IPTABLES-DROP: SRC=1.2.3.4 DST=5.6.7.8 PROTO=UDP DPT=53")
+        self.assertEqual(events, [])
+        self.assertEqual([(s["ip"], s["port"], s["proto"]) for s in specials], [("203.0.113.9", 22, "TCP"), ("1.2.3.4", 53, "UDP")])
+
+    def test_firewall_line_without_block_word_or_ports_is_ignored(self):
+        _, specials = self.feed("2025-10-01 10:00:00 fw kernel: [UFW ALLOW] SRC=1.1.1.1 DPT=22",
+                                "2025-10-01 10:00:00 fw kernel: [UFW BLOCK] SRC=1.1.1.1 no destination port")
+        self.assertEqual(specials, [])
+
+    def test_port_scan_needs_distinct_ports_in_the_window(self):
+        _, specials = self.feed(*[self.FW.format(s=i, port=20 + i) for i in range(10)],
+                                *[self.FW.format(s=i, port=23).replace("203.0.113.9", "203.0.113.10") for i in range(20)])
+        found = la.find_port_scans(specials, 10, 5)
+        self.assertEqual(list(found), ["203.0.113.9"])  # the host hammering one port is not a scanner
+        self.assertEqual(found["203.0.113.9"]["port_count"], 10)
+        self.assertEqual(la.find_port_scans(specials, 11, 5), {})
+
+    def test_port_scan_alert_blocklist_and_end_to_end(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        specials = []
+        events = la.parse_log(os.path.join(here, "sample_logs", "ufw.log"), specials=specials, year=2026)
+        res = la.analyse(events, specials, make_args())
+        self.assertEqual([a["type"] for a in res["alerts"]], ["port_scan"])
+        self.assertEqual([str(a) for a in la.blocklist_ips(res, include_private=True)], ["203.0.113.120"])
+
+    def test_ignore_user_drops_events_case_insensitively(self):
+        events = [ev(0, False, user="Nagios"), ev(1, False, user="root")]
+        self.assertEqual([e["user"] for e in la.filter_events(events, [], None, None, ["nagios"])], ["root"])
+        self.assertEqual(len(la.filter_events(events, [], None, None)), 2)
+        self.assertEqual(make_args("--ignore-user", "a", "--ignore-user", "b").ignore_user, ["a", "b"])
+
+    def test_windows_timestamp_formats(self):
+        for text, expected in (("2025-10-01 10:00:00", (10, 0)), ("2025-10-01T10:00:00.5Z", (10, 0)),
+                               ("10/01/2025 13:05:00", (13, 5)), ("10/01/2025 01:05:00 PM", (13, 5))):
+            when = la.parse_windows_time(text)
+            self.assertEqual((when.month, when.day, (when.hour, when.minute)), (10, 1, expected), text)
+        with self.assertRaises(ValueError):
+            la.parse_windows_time("25/10/2025 10:00:00")  # day-first is refused, not guessed
+
+    def test_windows_csv_with_us_timestamps(self):
+        text = "TimeCreated,EventId,TargetUserName,IpAddress\n10/01/2025 10:00:00,4625,bob,198.51.100.9\n"
+        with tempfile.TemporaryDirectory() as d:
+            events = la.parse_log(write_temp(d, "sec.csv", text))
+        self.assertEqual(events[0]["time"], datetime(2025, 10, 1, 10, 0))
 
 
 if __name__ == "__main__":

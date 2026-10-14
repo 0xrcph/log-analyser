@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-analyser"
+version = "1.0.0"
+description = "Spot brute force, password spraying, account takeover and other suspicious activity in SSH, Windows, web and firewall logs."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+geoip = ["geoip2"]
+
+[project.scripts]
+log-analyser = "log_analyser:main"
+
+[tool.setuptools]
+py-modules = ["log_analyser"]

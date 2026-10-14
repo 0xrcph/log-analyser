@@ -32,6 +32,9 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 - **Live mode** (`--follow`) that watches a growing log and alerts as attacks start, with **webhook** (Slack/Discord/Teams style) and **email** notifications
 - **Blocklist export** (`--blocklist`) as `ufw`, `iptables`, `nft` or plain text, and **baselines** (`--baseline`) so repeat runs only report what is new
 - **GeoIP that behaves**: rate-limited, cached in memory and on disk (`--geoip-cache`), or fully offline with a local MaxMind database (`--geoip-db`)
+- **Port-scan detection** from kernel firewall lines (`[UFW BLOCK] … SRC=… DPT=…`): one IP blocked on many different ports
+- **journalctl / RFC3339 timestamps** (`2026-10-01T10:00:00+0000`) and US-format Windows CSV dates
+- `--ignore-user` to silence monitoring/service accounts; installable as a `log-analyser` command (`pip install .`)
 - HTML report with **charts** (failed logins by hour and over time)
 - Pure Python 3 standard library, with nothing to install (`geoip2` only if you choose `--geoip-db`)
 
@@ -45,6 +48,8 @@ log-analyser/
 ├── sample_logs/auth.log              # generated SSH sample data
 ├── sample_logs/windows_security.csv  # generated Windows sample data
 ├── sample_logs/access.log            # generated nginx-style web log
+├── sample_logs/ufw.log               # generated firewall log (a port scan)
+├── pyproject.toml                    # `pip install .` gives a `log-analyser` command
 └── README.md
 ```
 
@@ -92,6 +97,8 @@ python log_analyser.py sample_logs/auth.log
 | `--travel` | off | Flag impossible travel between logins (needs GeoIP; see privacy note) |
 | `--travel-speed KMH` | `900` | Speed above which two logins count as impossible travel |
 | `--scan-paths N` | `3` | Distinct scanner-only URLs from one IP in the window that flag a web scanner |
+| `--scan-ports N` | `10` | Distinct ports from one IP blocked by the firewall inside the window that flag a port scan |
+| `--ignore-user NAME` | none | Ignore events for this account (repeatable, case-insensitive), e.g. a monitoring account |
 | `--sudo-threshold N` | `3` | Failed `sudo`/`su` attempts by one account in the window that are flagged |
 | `--geoip-cache FILE` | none | Remember GeoIP answers between runs (lookups are also rate-limited to about 40/min) |
 | `--geoip-db FILE` | none | Use a local MaxMind GeoLite2/GeoIP2 City `.mmdb` file instead of ip-api.com (`pip install geoip2`); no IP leaves your machine |
@@ -183,6 +190,10 @@ Webhook URLs are secrets: prefer the `LOG_ANALYSER_WEBHOOK` environment variable
 Lines that don't match are skipped. To support another text format (for example the real `/var/log/auth.log`, which has no year), adjust `LINE_PATTERN` in `log_analyser.py`.
 
 Also understood: `Failed/Accepted keyboard-interactive/pam`, `Invalid user X from IP`, `Connection closed by authenticating user X IP`, `sudo: bob : 3 incorrect password attempts` and `FAILED SU`. The "weak" lines (`Invalid user`, `Connection closed…`) only count when sshd did not also log a `Failed …` line for the same process id and IP, so one attempt is never counted twice.
+
+Timestamps can be `2026-10-01 10:00:00`, journalctl/RFC3339 `2026-10-01T10:00:00+0000` (the zone suffix is ignored, so times stay as written in the log) or classic syslog `Oct  3 02:14:05`.
+
+**Firewall lines** inside a syslog/ufw log are read by the same parser: any line with `SRC=`, `DPT=` and a `BLOCK`/`DROP`/`REJECT`/`DENY` word counts as a blocked attempt (`sample_logs/ufw.log`). They never count as logins; `--scan-ports` different ports from one IP in the window raise a port-scan alert.
 
 **nginx / Apache access log** ("combined" format, `--format web` or a file name containing `access`):
 
@@ -278,6 +289,11 @@ python log_analyser.py security.csv
 
 **Why it matters:** Each is a different angle on the same story: someone probing for a way in, or for root. These sections only appear when the log contains that kind of evidence.
 
+### 14. Port scans
+**What:** An IP whose connections your firewall blocked on 10 or more different ports inside the window (`--scan-ports`).
+
+**Why it matters:** Scanning is reconnaissance: the attacker is mapping which services you expose before choosing what to attack. Someone knocking repeatedly on one port is just noise, so only the number of *different* ports counts.
+
 ## About the sample data
 
 `generate_sample_logs.py` builds three days of fake traffic with a fixed random seed, so the results are repeatable. `auth.log` contains:
@@ -301,13 +317,15 @@ All IPs are from reserved documentation ranges (RFC 5737), so none belong to rea
 
 ## Limitations and ideas for improvement
 
-- Three log formats; firewall logs and the raw `.evtx` format are not supported, and Windows CSV timestamps must be `yyyy-MM-dd HH:mm:ss`
+- Not supported: the raw `.evtx` format, Windows day-first dates (`25/10/2025`, ambiguous so refused), and time-zone conversion (times are used as written)
 - Web logs only yield failures, so there is no compromise or new-IP detection for them; WordPress login detection is a heuristic
 - `--follow` handles one plain-text SSH log; `--geoip-db` is written against the `geoip2` API but is only unit-tested with a stand-in reader, not a real `.mmdb` file
 - Baseline alerts are matched on type, IP, user and start time, so a burst that keeps growing can be reported again when its worst window shifts
 - `--learn` is a simple heuristic and needs a few logins per user; a real system would use longer baselines
 - Threat-intelligence reputation lookups (e.g. AbuseIPDB) would add context to attacking IPs
-- Sudo/su failures and 4672 "special privileges" events with no IP are not tied to a source, and 4672 is not parsed yet
+- Sudo/su failures have no source IP, and Windows event 4672 ("special privileges") is not parsed because the export has no usable account or address for it
+- Deliberately left out: reputation lookups (AbuseIPDB, Tor lists) that need API keys and send your IPs to third parties, and running firewall commands automatically
+- Only tested on Python 3.13 so far; there is no CI yet (run `python -m unittest` on the Python versions you care about)
 
 ## Disclaimer
 

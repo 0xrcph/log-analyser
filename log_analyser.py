@@ -82,7 +82,9 @@ def section(title, colour):
 # Every parser turns a log line into an "event" dict: time, success, user, ip.
 # Things that are not a login (lockouts, web scanner probes, sudo failures) are "specials":
 # dicts with a "kind" of lockout / probe / priv_fail, kept in a separate list.
-TIME_PREFIX = (r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|[A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2}) .*?")
+# Timestamps: '2025-10-03 02:14:05', journalctl/RFC3339 '2025-10-03T02:14:05+0000', or syslog 'Oct  3 02:14:05'.
+TIME_PREFIX = (r"^(?P<time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+               r"|[A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2}) .*?")
 
 # Failed/Accepted <method> for [invalid user] <user> from <ip>. The method can be password, publickey,
 # keyboard-interactive/pam, gssapi-with-mic, hostbased, none ...
@@ -101,12 +103,16 @@ SU_PATTERNS = [
     re.compile(TIME_PREFIX + r"FAILED su for (?P<target>\S+) by (?P<user>\S+)"),
 ]
 PID_PATTERN = re.compile(r"\[(\d+)\]:")
+# Kernel firewall lines (ufw, iptables LOG rules): "... [UFW BLOCK] IN=eth0 SRC=203.0.113.5 DST=10.0.0.1 PROTO=TCP DPT=22 ..."
+TIME_ONLY = re.compile(TIME_PREFIX)
+FIREWALL_WORDS = re.compile(r"\b(?:BLOCK|DROP|REJECT|DENIED|DENY)\b", re.I)
+FW_SRC, FW_DPT, FW_PROTO = (re.compile(r"\bSRC=([0-9a-fA-F:.]+)"), re.compile(r"\bDPT=(\d+)"), re.compile(r"\bPROTO=(\w+)"))
 
 
 def parse_time(text, year):
     """Parse '2025-10-03 02:14:05' (ISO) or classic syslog 'Oct  3 02:14:05' (no year, so `year` is used)."""
-    if text[0].isdigit():
-        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    if text[0].isdigit():  # the time zone suffix, if any, is dropped: times stay as written in the log
+        return datetime.strptime(text[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
     return datetime.strptime(f"{year} {' '.join(text.split())}", "%Y %b %d %H:%M:%S")
 
 
@@ -182,6 +188,14 @@ class SshParser:
                     if len(self.weak) > self.memory:
                         del self.weak[next(iter(self.weak))]
                 return
+        if "SRC=" in line and "DPT=" in line and FIREWALL_WORDS.search(line):
+            stamp, src, dpt = TIME_ONLY.match(line), FW_SRC.search(line), FW_DPT.search(line)
+            when = self._when(stamp["time"]) if stamp else None
+            if when is not None and src and dpt:
+                proto = FW_PROTO.search(line)
+                specials.append({"kind": "fw_block", "time": when, "ip": src.group(1), "port": int(dpt.group(1)),
+                                 "proto": proto.group(1).upper() if proto else "?"})
+            return
         match = SUDO_PATTERN.match(line)
         if match:
             via, count, user = "sudo", int(match["n"]), match["user"]
@@ -201,6 +215,22 @@ WINDOWS_LOGON_TYPES = {"2", "3", "7", "10", "11"}
 LOCAL_IPS = {"", "-", "::1", "127.0.0.1", "::ffff:127.0.0.1"}
 
 
+def parse_windows_time(text):
+    """ISO ('2025-10-01 10:00:00' or with a 'T'), or US month-first ('10/01/2025 10:00:00', 12-hour with AM/PM too).
+
+    Day-first dates (01/10/2025) are ambiguous with month-first ones, so they are rejected rather than guessed.
+    """
+    text = text.strip()
+    if text[:4].isdigit():
+        return datetime.strptime(text[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"unrecognised Windows time: {text!r}")
+
+
 def parse_windows_csv(path, specials=None):
     """Read Windows Security events exported to CSV (see README for the export command).
 
@@ -215,7 +245,7 @@ def parse_windows_csv(path, specials=None):
             event_id = row["EventId"]
             if event_id not in ("4624", "4625", "4740"):
                 continue  # ignore every other kind of Windows event
-            when = datetime.strptime(row["TimeCreated"][:19], "%Y-%m-%d %H:%M:%S")
+            when = parse_windows_time(row["TimeCreated"])
             if event_id == "4740":
                 if specials is not None:
                     specials.append({"kind": "lockout", "time": when, "user": row["TargetUserName"],
@@ -463,8 +493,9 @@ def failures_by_hour(events):
     return counts
 
 
-def filter_events(events, allow, since, until):
-    """Drop events from allow-listed IPs/networks and outside the --since/--until range."""
+def filter_events(events, allow, since, until, ignore_users=()):
+    """Drop events from allow-listed IPs/networks, ignored accounts and outside the --since/--until range."""
+    ignored = {u.lower() for u in ignore_users}
     networks = []
     for item in allow:
         try:
@@ -481,6 +512,7 @@ def filter_events(events, allow, since, until):
 
     return [e for e in events
             if not allowed(e["ip"])
+            and str(e.get("user", "")).lower() not in ignored
             and (since is None or e["time"] >= since)
             and (until is None or e["time"] < until + timedelta(days=1))]
 
@@ -718,6 +750,24 @@ def find_web_scanners(specials, min_paths, window_minutes):
     return results
 
 
+def find_port_scans(specials, min_ports, window_minutes):
+    """IPs the firewall blocked on `min_ports`+ different ports inside one window (a port scan)."""
+    window = timedelta(minutes=window_minutes)
+    blocks = defaultdict(list)
+    for s in specials:
+        if s["kind"] == "fw_block":
+            blocks[s["ip"]].append(s)
+    results = {}
+    for ip, items in blocks.items():
+        items.sort(key=lambda s: s["time"])
+        best = widest_burst(items, window, min_ports, key=lambda s: (s["proto"], s["port"]))
+        if best:
+            burst = [s for s in items if best[1]["time"] <= s["time"] <= best[2]["time"]]
+            results[ip] = {"port_count": best[0], "first": best[1]["time"], "last": best[2]["time"],
+                           "ports": sorted({s["port"] for s in burst}), "attempts": len(burst)}
+    return results
+
+
 def find_priv_failures(specials, threshold, window_minutes):
     """Accounts with `threshold`+ failed sudo/su attempts in one window (someone probing for root)."""
     window = timedelta(minutes=window_minutes)
@@ -847,7 +897,7 @@ def add_locations(*groups):
 # -------------------------------------------------------------------- export
 def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None, distributed=None,
                  new_sources=None, multi_ip=None, takeovers=None, slow=None, travel=None, lockouts=None,
-                 scanners=None, priv_fails=None):
+                 scanners=None, priv_fails=None, port_scans=None):
     """Flatten every finding into a simple list of dicts (easy to save as JSON/CSV)."""
     alerts = []
     for ip, b in brute_force.items():
@@ -899,6 +949,11 @@ def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=Non
                        "time": d["first"].isoformat(sep=" "),
                        "details": f"{d['path_count']} scanner URLs, {d['requests']} requests: " + ", ".join(d["paths"][:6])
                                   + ("..." if len(d["paths"]) > 6 else "")})
+    for ip, d in (port_scans or {}).items():
+        shown = ", ".join(map(str, d["ports"][:8])) + ("..." if len(d["ports"]) > 8 else "")
+        alerts.append({"type": "port_scan", "severity": "MEDIUM", "ip": ip, "user": "-",
+                       "time": d["first"].isoformat(sep=" "),
+                       "details": f"{d['port_count']} different ports blocked, {d['attempts']} attempts: {shown}"})
     for user, d in (priv_fails or {}).items():
         alerts.append({"type": "privilege_escalation_attempts", "severity": "MEDIUM", "ip": "local", "user": user,
                        "time": d["first"].isoformat(sep=" "),
@@ -1086,7 +1141,7 @@ def blocklist_ips(res, include_private=False):
     Private, loopback and link-local addresses are skipped so you cannot lock yourself out
     (include_private=True keeps private/documentation ranges, handy for demos).
     """
-    ips = set(res["brute_force"]) | set(res["spray"]) | set(res["slow"]) | set(res["scanners"])
+    ips = set(res["brute_force"]) | set(res["spray"]) | set(res["slow"]) | set(res["scanners"]) | set(res.get("port_scans", {}))
     ips |= {e["ip"] for e in res["compromises"]}
     for d in res["distributed"].values():
         ips.update(d["ips"])
@@ -1199,10 +1254,11 @@ def analyse(events, specials, args):
         "lockouts": find_lockouts(specials),
         "scanners": find_web_scanners(specials, args.scan_paths, args.window),
         "priv_fails": find_priv_failures(specials, args.sudo_threshold, args.window),
+        "port_scans": find_port_scans(specials, args.scan_ports, args.window),
     }
     res["alerts"] = build_alerts(brute_force, compromises, odd_hours, res["spray"], res["privileged"], distributed,
                                  res["new_sources"], res["multi_ip"], res["takeovers"], slow, res["travel"],
-                                 res["lockouts"], res["scanners"], res["priv_fails"])
+                                 res["lockouts"], res["scanners"], res["priv_fails"], res["port_scans"])
     res["scores"] = risk_scores(res["alerts"])
     return res
 
@@ -1235,8 +1291,8 @@ class Follower:
             self.events[:] = [e for e in self.events if e["time"] >= cutoff]
             self.specials[:] = [s for s in self.specials if s["time"] >= cutoff]
         args = self.args
-        return analyse(filter_events(self.events, args.allow, args.since, args.until),
-                       filter_events(self.specials, args.allow, args.since, args.until), args)
+        return analyse(filter_events(self.events, args.allow, args.since, args.until, args.ignore_user),
+                       filter_events(self.specials, args.allow, args.since, args.until, args.ignore_user), args)
 
     def close(self):
         if self.file:
@@ -1433,6 +1489,12 @@ def print_report(path, events, res, args):
         for ip, d in sorted(res["scanners"].items(), key=lambda kv: -kv[1]["path_count"]):
             print(f"{YELLOW}{BOLD}[MEDIUM]{RESET} {BOLD}{ip}{RESET}  {d['path_count']} scanner URLs, {d['requests']} requests")
             print(f"   {DIM}paths:{RESET} {', '.join(d['paths'][:8])}{'...' if len(d['paths']) > 8 else ''}")
+    if res["port_scans"]:
+        section(f"PORT SCANS  ({len(res['port_scans'])} source(s))", YELLOW)
+        for ip, d in sorted(res["port_scans"].items(), key=lambda kv: -kv[1]["port_count"]):
+            print(f"{YELLOW}{BOLD}[MEDIUM]{RESET} {BOLD}{ip}{RESET}  {d['port_count']} different ports, {d['attempts']} blocked attempts "
+                  f"between {d['first']:%H:%M:%S} and {d['last']:%H:%M:%S} on {d['first']:%Y-%m-%d}")
+            print(f"   {DIM}ports:{RESET} {', '.join(map(str, d['ports'][:12]))}{'...' if len(d['ports']) > 12 else ''}")
     if res["priv_fails"]:
         section(f"FAILED sudo/su ATTEMPTS  ({len(res['priv_fails'])} account(s))", YELLOW)
         for user, d in sorted(res["priv_fails"].items(), key=lambda kv: -kv[1]["count"]):
@@ -1492,13 +1554,14 @@ def print_report(path, events, res, args):
               ("privileged login(s)", len(privileged)), ("distributed attack(s)", len(distributed)),
               ("new-IP login(s)", len(new_sources)), ("multi-IP account(s)", len(multi_ip)),
               ("impossible-travel login(s)", len(res["travel"])), ("lockout(s)", len(res["lockouts"])),
-              ("web scanner(s)", len(res["scanners"])), ("sudo/su account(s)", len(res["priv_fails"]))]
+              ("web scanner(s)", len(res["scanners"])), ("port scan(s)", len(res["port_scans"])),
+              ("sudo/su account(s)", len(res["priv_fails"]))]
     total_alerts = len(res["alerts"])
     colour = RED if compromises or res["takeovers"] else YELLOW if total_alerts else GREEN
     print(f"{colour}{BOLD}{total_alerts} alert(s){RESET}" + (": " + ", ".join(f"{n} {label}" for label, n in counts if n) if total_alerts else ""))
     if compromises or res["takeovers"]:
         print(f"{RED}Action:{RESET} reset the affected account(s), review what they did, and block the source IP(s).")
-    elif brute_force or spray or distributed or multi_ip or res["slow"] or res["scanners"]:
+    elif brute_force or spray or distributed or multi_ip or res["slow"] or res["scanners"] or res["port_scans"]:
         print(f"{YELLOW}Action:{RESET} block the source IP(s) (see --blocklist) and consider rate-limiting or MFA.")
     print()
 
@@ -1591,6 +1654,10 @@ def build_parser():
                         help="use a local MaxMind GeoLite2/GeoIP2 City .mmdb file instead of ip-api.com (pip install geoip2)")
     parser.add_argument("--scan-paths", type=int, default=3,
                         help="distinct scanner-only URLs from one IP in the window to flag a web scanner (default 3)")
+    parser.add_argument("--scan-ports", type=int, default=10,
+                        help="distinct ports from one IP blocked by the firewall in the window to flag a port scan (default 10)")
+    parser.add_argument("--ignore-user", action="append", default=[], metavar="NAME",
+                        help="ignore events for this account, e.g. a monitoring/service account (repeatable, case-insensitive)")
     parser.add_argument("--sudo-threshold", type=int, default=3,
                         help="failed sudo/su attempts by one account in the window to flag (default 3)")
     parser.add_argument("--blocklist", metavar="FILE", help="write block commands for the attacking IPs to this file (never run automatically)")
@@ -1656,8 +1723,8 @@ def main():
             sys.exit(f"Error: could not read {path}. Check it matches the expected format (see README).")
     source = ", ".join(args.logfile)
 
-    events = filter_events(events, args.allow, args.since, args.until)
-    specials = filter_events(specials, args.allow, args.since, args.until)
+    events = filter_events(events, args.allow, args.since, args.until, args.ignore_user)
+    specials = filter_events(specials, args.allow, args.since, args.until, args.ignore_user)
     events.sort(key=lambda e: e["time"])
     specials.sort(key=lambda s: s["time"])
     res = analyse(events, specials, args)

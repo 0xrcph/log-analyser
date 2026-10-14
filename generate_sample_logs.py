@@ -163,3 +163,24 @@ web_lines.sort(key=lambda pair: pair[0])
 with open("sample_logs/access.log", "w", encoding="utf-8") as f:
     f.write("\n".join(text for _, text in web_lines) + "\n")
 print(f"Wrote {len(web_lines)} requests to sample_logs/access.log")
+
+# ------------------------------------------------------------ firewall sample
+# Kernel firewall lines as written by ufw: one host sweeping many ports (a port scan) and some normal noise.
+fw_lines = []
+
+
+def add_fw(when, ip, port):
+    fw_lines.append((when, f"{when:%Y-%m-%d %H:%M:%S} fw kernel: [UFW BLOCK] IN=eth0 OUT= SRC={ip} DST=198.51.100.1 "
+                           f"LEN=44 TOS=0x00 TTL=52 PROTO=TCP SPT={random.randint(30000, 65000)} DPT={port} WINDOW=1024 SYN"))
+
+
+t = START + timedelta(days=1, hours=6)
+for i, port in enumerate([21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 3306, 3389, 5432, 8080]):
+    add_fw(t + timedelta(seconds=i), "203.0.113.120", port)
+for i in range(4):  # a host that keeps knocking on one port is not a scan
+    add_fw(t + timedelta(minutes=10, seconds=i * 30), "203.0.113.121", 23)
+
+fw_lines.sort(key=lambda pair: pair[0])
+with open("sample_logs/ufw.log", "w", encoding="utf-8") as f:
+    f.write("\n".join(text for _, text in fw_lines) + "\n")
+print(f"Wrote {len(fw_lines)} firewall lines to sample_logs/ufw.log")
