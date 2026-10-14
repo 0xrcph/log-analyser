@@ -152,6 +152,52 @@ class AdvancedTests(unittest.TestCase):
                 sys.argv = old
 
 
+class NewFeatureTests(unittest.TestCase):
+    def test_new_source_login_needs_history(self):
+        events = [ev(i, True, user="bob", ip="10.0.0.1") for i in range(3)] + [ev(5, True, user="bob", ip="198.51.100.77")]
+        hits = la.find_new_source_logins(events)
+        self.assertEqual([e["ip"] for e in hits], ["198.51.100.77"])
+        # too little history: a second IP on the 2nd login is not suspicious yet
+        few = [ev(0, True, user="eve", ip="10.0.0.1"), ev(1, True, user="eve", ip="10.0.0.2")]
+        self.assertEqual(la.find_new_source_logins(few), [])
+
+    def test_new_source_login_reported_once_per_ip(self):
+        events = [ev(i, True, user="bob", ip="10.0.0.1") for i in range(3)]
+        events += [ev(5, True, user="bob", ip="198.51.100.77"), ev(6, True, user="bob", ip="198.51.100.77")]
+        self.assertEqual(len(la.find_new_source_logins(events)), 1)
+
+    def test_multi_ip_logins(self):
+        events = [ev(i, True, user="alice", ip=f"203.0.113.{i}") for i in range(3)]
+        self.assertEqual(la.find_multi_ip_logins(events, 3, 5)["alice"]["ip_count"], 3)
+        self.assertEqual(la.find_multi_ip_logins(events, 4, 5), {})
+        spread = [ev(0, True, user="alice", ip=f"203.0.113.{i}", hour=10 + i) for i in range(3)]
+        self.assertEqual(la.find_multi_ip_logins(spread, 3, 5), {})
+
+    def test_new_alert_types_are_built(self):
+        events = [ev(i, True, user="alice", ip=f"203.0.113.{i}") for i in range(3)]
+        multi = la.find_multi_ip_logins(events, 3, 5)
+        alerts = la.build_alerts({}, [], [], None, None, None, [events[0]], multi)
+        self.assertEqual({a["type"] for a in alerts}, {"new_source_login", "multi_ip_login"})
+
+    def test_gzip_ssh_log(self):
+        import gzip
+        line = "2025-10-01 10:00:00 h sshd[1]: Failed password for root from 198.51.100.9 port 22 ssh2\n"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "auth.log.gz")
+            with gzip.open(path, "wt", encoding="utf-8") as f:
+                f.write(line)
+            self.assertEqual(len(la.parse_log(path)), 1)
+
+    def test_gzip_csv_is_detected_as_windows(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sec.csv.gz")
+            with gzip.open(path, "wt", encoding="utf-8", newline="") as f:
+                f.write("TimeCreated,EventId,TargetUserName,IpAddress\n2025-10-01 10:00:00,4625,bob,198.51.100.9\n")
+            events = la.parse_log(path)
+        self.assertEqual((events[0]["user"], events[0]["success"]), ("bob", False))
+
+
 class ExportTests(unittest.TestCase):
     def test_html_report_escapes_input(self):
         events = [ev(0, False, user="<script>")]

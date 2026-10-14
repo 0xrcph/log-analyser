@@ -9,6 +9,9 @@ It reads an SSH-style auth log and looks for:
   6. Privileged logins - root/admin accounts logged into from an IP that failed first
   7. Distributed attacks - many IPs sharing the work of attacking one account
   8. A combined 0-100 risk score per source IP
+  9. Logins from a never-seen-before IP (--new-ip) and one account used from many IPs (--multi-ip N)
+
+Log files can be plain text, gzip (.gz), several at once, or '-' to read from stdin.
 
 Usage:  python log_analyser.py sample_logs/auth.log
         python log_analyser.py sample_logs/windows_security.csv
@@ -16,11 +19,13 @@ Usage:  python log_analyser.py sample_logs/auth.log
         python log_analyser.py auth.log --allow 10.0.0.0/8 --since 2025-01-01 --spray-users 4 --fail-on-alert
         python log_analyser.py auth.log --privileged root --markdown report.md
         python log_analyser.py auth.log --config analyser.json --html report.html
+        python log_analyser.py auth.log auth.log.1.gz --new-ip --multi-ip 3 --no-color
         python log_analyser.py auth.log --threshold 5 --window 5 --night-start 0 --night-end 6
 """
 
 import argparse
 import csv
+import gzip
 import html
 import json
 import ipaddress
@@ -41,6 +46,12 @@ if hasattr(sys.stdout, "reconfigure"):
 RED, YELLOW, GREEN, CYAN = "\033[91m", "\033[93m", "\033[92m", "\033[96m"
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
 WIDTH = 72
+
+
+def disable_colour():
+    """Switch off ANSI colours (for --no-color or the NO_COLOR variable)."""
+    global RED, YELLOW, GREEN, CYAN, BOLD, DIM, RESET
+    RED = YELLOW = GREEN = CYAN = BOLD = DIM = RESET = ""
 
 
 def banner(text):
@@ -71,6 +82,15 @@ def parse_time(text, year):
     return datetime.strptime(f"{year} {' '.join(text.split())}", "%Y %b %d %H:%M:%S")
 
 
+def open_text(path, **kwargs):
+    """Open a log for reading as text: '-' is stdin, '*.gz' is decompressed on the fly."""
+    if path == "-":
+        return sys.stdin
+    if path.lower().endswith(".gz"):
+        return gzip.open(path, "rt", **kwargs)
+    return open(path, **kwargs)
+
+
 def parse_windows_csv(path):
     """Read Windows Security events exported to CSV (see README for the export command).
 
@@ -78,7 +98,7 @@ def parse_windows_csv(path):
     Needed columns: TimeCreated, EventId, TargetUserName, IpAddress.
     """
     events = []
-    with open(path, encoding="utf-8-sig", newline="") as f:  # utf-8-sig handles PowerShell's BOM
+    with open_text(path, encoding="utf-8-sig", newline="") as f:  # utf-8-sig handles PowerShell's BOM
         for row in csv.DictReader(f):
             if row["EventId"] not in ("4624", "4625"):
                 continue  # ignore every other kind of Windows event
@@ -93,7 +113,10 @@ def parse_windows_csv(path):
 
 def parse_log(path, log_format="auto", year=None):
     """Pick the right parser. 'auto' guesses from the file extension (.csv = Windows)."""
-    if log_format == "windows" or (log_format == "auto" and path.lower().endswith(".csv")):
+    name = path.lower()
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if log_format == "windows" or (log_format == "auto" and name.endswith(".csv")):
         return parse_windows_csv(path)
     return parse_ssh_log(path, year)
 
@@ -107,7 +130,7 @@ def parse_ssh_log(path, year=None):
     """
     year = year or datetime.now().year
     events = []
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open_text(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             match = LINE_PATTERN.match(line)
             if match:
@@ -371,6 +394,60 @@ def find_privileged_logins(events, privileged, compromises):
     return hits
 
 
+def find_new_source_logins(events, min_history=3):
+    """Successful logins from an IP the account has never logged in from before.
+
+    An account needs at least `min_history` earlier successful logins first, otherwise
+    every IP would look new. Only the first login from each new IP is reported.
+    """
+    seen = defaultdict(set)    # user -> IPs it has already logged in from
+    count = defaultdict(int)   # user -> number of earlier successful logins
+    hits = []
+    for e in events:  # events are time-sorted
+        if not e["success"]:
+            continue
+        if count[e["user"]] >= min_history and e["ip"] not in seen[e["user"]]:
+            hits.append(e)
+        seen[e["user"]].add(e["ip"])
+        count[e["user"]] += 1
+    return hits
+
+
+def find_multi_ip_logins(events, min_ips, window_minutes):
+    """Find accounts that logged in successfully from `min_ips` or more IPs inside one window.
+
+    One person rarely appears from several networks at once, so this points at shared
+    or stolen credentials. Returns user -> info about the widest burst.
+    """
+    window = timedelta(minutes=window_minutes)
+    logins_by_user = defaultdict(list)
+    for e in events:
+        if e["success"]:
+            logins_by_user[e["user"]].append(e)
+
+    results = {}
+    for user, logins in logins_by_user.items():
+        logins.sort(key=lambda e: e["time"])
+        start = 0
+        best = None  # (distinct ips, first_event, last_event)
+        for end in range(len(logins)):
+            while logins[end]["time"] - logins[start]["time"] > window:
+                start += 1
+            ips = {e["ip"] for e in logins[start:end + 1]}
+            if len(ips) >= min_ips and (best is None or len(ips) > best[0]):
+                best = (len(ips), logins[start], logins[end])
+        if best:
+            burst = [e for e in logins if best[1]["time"] <= e["time"] <= best[2]["time"]]
+            results[user] = {
+                "ip_count": best[0],
+                "first": best[1]["time"],
+                "last": best[2]["time"],
+                "ips": sorted({e["ip"] for e in burst}),
+                "logins": len(burst),
+            }
+    return results
+
+
 # -------------------------------------------------------------------- geoip
 def lookup_ip(ip):
     """Look up where an IP is (country, city, ISP) using the free ip-api.com service.
@@ -401,7 +478,8 @@ def add_locations(brute_force):
 
 
 # -------------------------------------------------------------------- export
-def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None, distributed=None):
+def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=None, distributed=None,
+                 new_sources=None, multi_ip=None):
     """Flatten every finding into a simple list of dicts (easy to save as JSON/CSV)."""
     alerts = []
     for ip, b in brute_force.items():
@@ -424,6 +502,15 @@ def build_alerts(brute_force, compromises, odd_hours, spray=None, privileged=Non
         alerts.append({"type": "privileged_login", "severity": "MEDIUM", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "),
                        "details": "privileged account login from an IP with earlier failures"})
+    for e in new_sources or []:
+        alerts.append({"type": "new_source_login", "severity": "MEDIUM", "ip": e["ip"], "user": e["user"],
+                       "time": e["time"].isoformat(sep=" "),
+                       "details": "first login by this account from this IP"})
+    for user, d in (multi_ip or {}).items():
+        alerts.append({"type": "multi_ip_login", "severity": "HIGH", "ip": f"multiple ({d['ip_count']} IPs)", "user": user,
+                       "time": d["first"].isoformat(sep=" "),
+                       "details": f"{d['logins']} logins from {d['ip_count']} IPs until {d['last']:%H:%M:%S}: "
+                                  + ", ".join(d["ips"])})
     for e in odd_hours:
         alerts.append({"type": "unusual_hour_login", "severity": "LOW", "ip": e["ip"], "user": e["user"],
                        "time": e["time"].isoformat(sep=" "), "details": "login outside normal hours"})
@@ -524,10 +611,12 @@ def bar(count, biggest, length=20):
 
 
 def print_report(path, events, brute_force, odd_hours, compromises, args, spray=None, privileged=None,
-                 distributed=None, scores=None):
+                 distributed=None, scores=None, new_sources=None, multi_ip=None):
     spray = spray or {}
     privileged = privileged or []
     distributed = distributed or {}
+    new_sources = new_sources or []
+    multi_ip = multi_ip or {}
     banner("LOGIN LOG ANALYSER")
     successes = sum(e["success"] for e in events)
     print(f"{DIM}File:{RESET} {path}")
@@ -595,6 +684,25 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
     else:
         print(f"{GREEN}✔ No privileged logins from IPs that failed first.{RESET}")
 
+    # --- New source IPs and multi-IP logins (opt-in)
+    if args.new_ip:
+        section(f"LOGINS FROM A NEW IP  ({len(new_sources)})", YELLOW)
+        if new_sources:
+            for e in new_sources:
+                print(f"{YELLOW}●{RESET} {e['time']:%Y-%m-%d %H:%M:%S}  {BOLD}{e['user']:<14}{RESET} first time from {e['ip']}")
+        else:
+            print(f"{GREEN}✔ No account logged in from a never-seen-before IP.{RESET}")
+    if args.multi_ip:
+        section(f"ONE ACCOUNT, MANY IPs  ({len(multi_ip)})", RED)
+        if multi_ip:
+            for user, d in sorted(multi_ip.items(), key=lambda kv: -kv[1]["ip_count"]):
+                print(f"{YELLOW}{BOLD}[HIGH]{RESET} {BOLD}{user}{RESET}")
+                print(f"   {d['logins']} logins from {d['ip_count']} different IPs "
+                      f"between {d['first']:%H:%M:%S} and {d['last']:%H:%M:%S} on {d['first']:%Y-%m-%d}")
+                print(f"   {DIM}source IPs:{RESET} {', '.join(d['ips'])}")
+        else:
+            print(f"{GREEN}✔ No account used from several IPs at once.{RESET}")
+
     # --- Unusual hours
     section(f"UNUSUAL-HOUR LOGINS  ({len(odd_hours)})", YELLOW)
     if odd_hours:
@@ -643,15 +751,17 @@ def print_report(path, events, brute_force, odd_hours, compromises, args, spray=
     # --- Summary
     section("SUMMARY", CYAN)
     total_alerts = (len(brute_force) + len(spray) + len(compromises) + len(odd_hours)
-                    + len(privileged) + len(distributed))
+                    + len(privileged) + len(distributed) + len(new_sources) + len(multi_ip))
     colour = RED if compromises else YELLOW if total_alerts else GREEN
     print(f"{colour}{BOLD}{total_alerts} alert(s){RESET}: {len(brute_force)} brute-force source(s), "
           f"{len(spray)} spraying source(s), {len(compromises)} possible compromise(s), "
           f"{len(odd_hours)} unusual-hour login(s), {len(privileged)} privileged login(s), "
-          f"{len(distributed)} distributed attack(s)")
+          f"{len(distributed)} distributed attack(s)"
+          + (f", {len(new_sources)} new-IP login(s)" if args.new_ip else "")
+          + (f", {len(multi_ip)} multi-IP account(s)" if args.multi_ip else ""))
     if compromises:
         print(f"{RED}Action:{RESET} reset the affected account(s), review what they did, and block the source IP(s).")
-    elif brute_force or spray or distributed:
+    elif brute_force or spray or distributed or multi_ip:
         print(f"{YELLOW}Action:{RESET} block the source IP(s) and consider rate-limiting or MFA.")
     print()
 
@@ -694,7 +804,8 @@ def apply_config(parser):
 
 def main():
     parser = argparse.ArgumentParser(description="Detect brute-force and unusual-hour logins in an auth log.")
-    parser.add_argument("logfile", help="path to the log file")
+    parser.add_argument("logfile", nargs="+",
+                        help="log file(s); several files are merged, .gz is decompressed, '-' reads stdin")
     parser.add_argument("--threshold", type=int, default=5, help="failures needed to flag brute force (default 5)")
     parser.add_argument("--window", type=int, default=5, help="time window in minutes (default 5)")
     parser.add_argument("--night-start", type=int, default=0, help="first 'unusual' hour, 0-23 (default 0)")
@@ -725,15 +836,25 @@ def main():
                         help="JSON file of default options, e.g. {\"threshold\": 3, \"allow\": [\"10.0.0.0/8\"]}; command-line flags win")
     parser.add_argument("--dist-ips", type=int, default=5,
                         help="distinct IPs failing against one account within the window to flag a distributed attack (default 5)")
+    parser.add_argument("--new-ip", action="store_true",
+                        help="flag a successful login from an IP the account has never used before")
+    parser.add_argument("--multi-ip", type=int, default=0, metavar="N",
+                        help="flag accounts that log in from N or more different IPs within the window (0 = off)")
+    parser.add_argument("--no-color", action="store_true", help="plain output without ANSI colours")
     apply_config(parser)
     args = parser.parse_args()
+    if args.no_color or os.environ.get("NO_COLOR"):
+        disable_colour()
 
-    try:
-        events = parse_log(args.logfile, args.format, args.year)
-    except FileNotFoundError:
-        sys.exit(f"Error: file not found: {args.logfile}")
-    except (KeyError, ValueError):
-        sys.exit("Error: could not read the file. Check it matches the expected format (see README).")
+    events = []
+    for path in args.logfile:
+        try:
+            events += parse_log(path, args.format, args.year)
+        except FileNotFoundError:
+            sys.exit(f"Error: file not found: {path}")
+        except (KeyError, ValueError, OSError):
+            sys.exit(f"Error: could not read {path}. Check it matches the expected format (see README).")
+    source = ", ".join(args.logfile)
 
     events = filter_events(events, args.allow, args.since, args.until)
     events.sort(key=lambda e: e["time"])
@@ -748,18 +869,20 @@ def main():
     if args.geoip:
         add_locations(brute_force)
     distributed = find_distributed_attack(events, args.dist_ips, args.window)
-    alerts = build_alerts(brute_force, compromises, odd_hours, spray, privileged, distributed)
-    print_report(args.logfile, events, brute_force, odd_hours, compromises, args, spray, privileged,
-                 distributed, risk_scores(alerts))
+    new_sources = find_new_source_logins(events) if args.new_ip else []
+    multi_ip = find_multi_ip_logins(events, args.multi_ip, args.window) if args.multi_ip else {}
+    alerts = build_alerts(brute_force, compromises, odd_hours, spray, privileged, distributed, new_sources, multi_ip)
+    print_report(source, events, brute_force, odd_hours, compromises, args, spray, privileged,
+                 distributed, risk_scores(alerts), new_sources, multi_ip)
     export_alerts(alerts, args.json, args.csv)
     if args.markdown:
-        export_markdown(args.markdown, args.logfile, events, alerts)
+        export_markdown(args.markdown, source, events, alerts)
     if args.html:
-        export_html(args.html, args.logfile, events, alerts)
+        export_html(args.html, source, events, alerts)
     if args.fail_on_alert:
         if compromises:
             sys.exit(2)
-        if brute_force or spray or odd_hours or privileged or distributed:
+        if brute_force or spray or odd_hours or privileged or distributed or new_sources or multi_ip:
             sys.exit(1)
 
 
