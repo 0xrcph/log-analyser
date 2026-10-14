@@ -24,7 +24,16 @@ Built as a beginner cybersecurity portfolio project to practise log analysis, th
 - Optional **GeoIP lookup** of attacking IPs (`--geoip`)
 - **JSON, CSV, Markdown and self-contained HTML export** of all alerts, plus `--top N` to focus on the worst offenders
 - Severity labels, a mini bar chart and a final summary with recommended actions
-- Pure Python 3 standard library, with nothing to install
+- **More SSH line types**: `keyboard-interactive/pam`, `none`, bare `Invalid user …` and `Connection closed by authenticating user …` lines, with each attempt counted once even when sshd logs it three ways
+- **Account takeover detection**: a login right after failures on the same account from *any* IP, or during a distributed attack
+- **Low-and-slow detection**: a patient IP that stays under the 5-minute rule but fails 20+ times in 24 hours (`--slow-threshold`, `--slow-window`)
+- **Impossible travel** (`--travel`): one account logging in from far-apart places faster than a jet could fly
+- **More sources**: nginx/Apache access logs (401/403 floods, scanner URLs such as `/.env`), Windows lockouts (event 4740) and logon types, repeated failed `sudo`/`su`
+- **Live mode** (`--follow`) that watches a growing log and alerts as attacks start, with **webhook** (Slack/Discord/Teams style) and **email** notifications
+- **Blocklist export** (`--blocklist`) as `ufw`, `iptables`, `nft` or plain text, and **baselines** (`--baseline`) so repeat runs only report what is new
+- **GeoIP that behaves**: rate-limited, cached in memory and on disk (`--geoip-cache`), or fully offline with a local MaxMind database (`--geoip-db`)
+- HTML report with **charts** (failed logins by hour and over time)
+- Pure Python 3 standard library, with nothing to install (`geoip2` only if you choose `--geoip-db`)
 
 ## Project structure
 
@@ -35,6 +44,7 @@ log-analyser/
 ├── generate_sample_logs.py  # creates realistic fake logs for testing
 ├── sample_logs/auth.log              # generated SSH sample data
 ├── sample_logs/windows_security.csv  # generated Windows sample data
+├── sample_logs/access.log            # generated nginx-style web log
 └── README.md
 ```
 
@@ -76,7 +86,25 @@ python log_analyser.py sample_logs/auth.log
 | `--html FILE` | none | Also save a self-contained HTML report with a colour-coded alerts table |
 | `--year YYYY` | this year | Year to assume for syslog timestamps (`Oct  3 02:14:05`), which carry none |
 | `--privileged NAMES` | `root,admin,administrator` | Comma-separated privileged accounts to watch for logins from IPs that failed first |
-| `--format` | `auto` | `ssh` or `windows`; `auto` treats `.csv` files as Windows |
+| `--format` | `auto` | `ssh`, `windows` or `web`; `auto` treats `*.csv` as Windows and names containing `access` as a web log |
+| `--slow-threshold N` | `20` | Failures from one IP inside `--slow-window` that flag a low-and-slow attack (`0` = off) |
+| `--slow-window HOURS` | `24` | The long window for low-and-slow detection |
+| `--travel` | off | Flag impossible travel between logins (needs GeoIP; see privacy note) |
+| `--travel-speed KMH` | `900` | Speed above which two logins count as impossible travel |
+| `--scan-paths N` | `3` | Distinct scanner-only URLs from one IP in the window that flag a web scanner |
+| `--sudo-threshold N` | `3` | Failed `sudo`/`su` attempts by one account in the window that are flagged |
+| `--geoip-cache FILE` | none | Remember GeoIP answers between runs (lookups are also rate-limited to about 40/min) |
+| `--geoip-db FILE` | none | Use a local MaxMind GeoLite2/GeoIP2 City `.mmdb` file instead of ip-api.com (`pip install geoip2`); no IP leaves your machine |
+| `--blocklist FILE` | none | Write block commands for attacking IPs (never run automatically) |
+| `--blocklist-format` | `plain` | `plain`, `ufw`, `iptables` or `nft` |
+| `--blocklist-private` | off | Also include private/documentation-range IPs (skipped by default so you cannot lock yourself out) |
+| `--baseline FILE` | none | An earlier `--json` file; only alerts *not* in it are exported, notified and counted by `--fail-on-alert` |
+| `--update-baseline` | off | Add this run's alerts to the `--baseline` file afterwards |
+| `--webhook URL` | none | POST alerts as JSON (`text` and `content` keys). Can also come from the `LOG_ANALYSER_WEBHOOK` variable so the secret URL stays out of your shell history |
+| `--smtp HOST[:PORT]`, `--mail-to`, `--mail-from` | none | Email alerts; `SMTP_USER` / `SMTP_PASSWORD` environment variables log in (STARTTLS on 587, SSL on 465) |
+| `--notify-min-severity` | `HIGH` | Lowest severity sent by webhook/email (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`) |
+| `--follow` | off | Watch one plain-text SSH log and print/notify new alerts as they appear (Ctrl+C to stop) |
+| `--follow-hours H`, `--follow-interval S` | `24`, `1` | How much history `--follow` keeps in memory, and how often it checks the file |
 
 Examples:
 
@@ -95,7 +123,24 @@ zcat auth.log.2.gz | python log_analyser.py - --no-color
 
 # Learned hours, top 3 attackers, save results
 python log_analyser.py sample_logs/auth.log --learn --top 3 --json alerts.json --csv alerts.csv
+
+# nginx / Apache access log: scanners and 401/403 floods
+python log_analyser.py sample_logs/access.log
+
+# Only report what is NEW since last time (run it from cron), and alert on the new HIGH+ ones
+python log_analyser.py /var/log/auth.log --baseline known.json --update-baseline --webhook "$HOOK_URL" --fail-on-alert
+
+# Block the attackers (review the file first, then run it yourself)
+python log_analyser.py /var/log/auth.log --blocklist block.sh --blocklist-format ufw
+
+# Watch a log live and email HIGH+ alerts
+SMTP_USER=me SMTP_PASSWORD=... python log_analyser.py /var/log/auth.log --follow --smtp smtp.example.com:587 --mail-to ops@example.com
+
+# Impossible travel with no IP leaving the machine
+python log_analyser.py auth.log --travel --geoip-db GeoLite2-City.mmdb --geoip-cache geo.json
 ```
+
+`--follow` reads the existing file first (those alerts are not repeated), then reports each *new* alert once. It survives log rotation and keeps only the last `--follow-hours` of events in memory. With `--baseline`, exports/notifications/exit codes use only the new alerts, while the terminal report still shows everything.
 
 ### Config file
 
@@ -121,7 +166,10 @@ python log_analyser.py auth.log --config analyser.json --html report.html
 Fixed hours flag *anyone* who logs in at night, including legitimate night-shift staff. With `--learn`, the tool builds each user's normal hours from their own successful logins and only flags logins far from that pattern (more than 3 hours from all their other logins; users with fewer than 3 logins are skipped). On the sample log, the fixed rule raises 3 false alarms about night-shift user `frank`, and `--learn` doesn't.
 
 ### GeoIP privacy note
-`--geoip` sends public attacker IPs to the free service [ip-api.com](https://ip-api.com) over HTTP. Private/reserved addresses are never sent, and it is off by default. Don't use it on logs where even the IPs are sensitive. The sample logs only contain reserved addresses, so they show "private/reserved address".
+`--geoip` sends public attacker IPs to the free service [ip-api.com](https://ip-api.com), and that free plan is **plain HTTP only**, so the addresses travel unencrypted. Private/reserved addresses are never sent, lookups are rate-limited and cached, and it is off by default. `--travel` additionally looks up the IPs of *successful* logins (your real users). To keep everything local, download a MaxMind GeoLite2 City database and use `--geoip-db`. Don't use the web lookup on logs where even the IPs are sensitive. The sample logs only contain reserved addresses, so they show "private/reserved address".
+
+### Notifications and secrets
+Webhook URLs are secrets: prefer the `LOG_ANALYSER_WEBHOOK` environment variable over `--webhook` (command-line arguments show up in process lists and shell history). Only `http://` and `https://` URLs are accepted. A failing webhook or mail server prints a warning but never stops the analysis. Blocklists are only written to a file; the tool never runs firewall commands itself.
 
 ### Expected log formats
 
@@ -134,10 +182,20 @@ Fixed hours flag *anyone* who logs in at night, including legitimate night-shift
 
 Lines that don't match are skipped. To support another text format (for example the real `/var/log/auth.log`, which has no year), adjust `LINE_PATTERN` in `log_analyser.py`.
 
-**Windows Security log (CSV):** columns `TimeCreated, EventId, TargetUserName, IpAddress`. Event 4625 is a failed logon and 4624 is a successful one. You can export your own from an elevated PowerShell:
+Also understood: `Failed/Accepted keyboard-interactive/pam`, `Invalid user X from IP`, `Connection closed by authenticating user X IP`, `sudo: bob : 3 incorrect password attempts` and `FAILED SU`. The "weak" lines (`Invalid user`, `Connection closed…`) only count when sshd did not also log a `Failed …` line for the same process id and IP, so one attempt is never counted twice.
+
+**nginx / Apache access log** ("combined" format, `--format web` or a file name containing `access`):
+
+```
+203.0.113.99 - - [01/Oct/2026:05:00:00 +0000] "GET /.env HTTP/1.1" 404 512 "-" "Mozilla/5.0"
+```
+
+A 401/403 on an ordinary path is a failed login (user = the HTTP-auth name or `-`); a failed `POST /wp-login.php` (WordPress answers 200) also counts; a 4xx on a scanner-only URL (`/.env`, `/.git/`, `/phpmyadmin`, `/xmlrpc.php` …) is a probe, and `--scan-paths` different probes from one IP raise a web-scanner alert. Web logs contain no reliable "success", so only failures are analysed.
+
+**Windows Security log (CSV):** columns `TimeCreated, EventId, TargetUserName, IpAddress`. Event 4625 is a failed logon, 4624 a successful one and 4740 an account lockout. An optional `LogonType` column drops service/batch logons (only types 2, 3, 7, 10 and 11 are kept), and a local logon with no address (`-`, `::1`) is shown as `local` instead of being lumped in with a real source. You can export your own from an elevated PowerShell:
 
 ```powershell
-Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624,4625} -MaxEvents 5000 |
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624,4625,4740} -MaxEvents 5000 |
   ForEach-Object {
     $x = [xml]$_.ToXml()
     $d = @{}; $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
@@ -146,6 +204,8 @@ Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624,4625} -MaxEvents 500
       EventId        = $_.Id
       TargetUserName = $d['TargetUserName']
       IpAddress      = $d['IpAddress']
+      LogonType      = $d['LogonType']
+      CallerComputerName = $d['CallerComputerName']  # 4740 lockouts only: the machine the bad logons came from
     }
   } | Export-Csv security.csv -NoTypeInformation
 python log_analyser.py security.csv
@@ -198,6 +258,26 @@ python log_analyser.py security.csv
 
 **Why it matters:** One IP that brute-forces, sprays *and* logs in successfully is far more urgent than one that only logged in at an odd hour. The ranking tells you which IP to deal with first.
 
+### 10. Account takeover
+**What:** A successful login on an account that had `--threshold` or more failures inside the window (from any mix of IPs), or that succeeded during a distributed attack on it. Logins already reported as a possible compromise are skipped, and the failures are cleared after a login so one burst gives one alert.
+
+**Why it matters:** The "possible compromise" rule only fires when the *same IP* brute-forced and then got in. A botnet that spreads guesses over many addresses, then logs in from one of them, slips past it. A real user who fumbles their password five times will also trigger this, so treat it as "check with the user", not proof.
+
+### 11. Low-and-slow attacks
+**What:** An IP with 20+ failures inside 24 hours (`--slow-threshold`, `--slow-window`) that did not already trip the brute-force rule.
+
+**Why it matters:** Patient attackers deliberately stay under per-minute thresholds. A long window catches them. `--slow-threshold 0` turns it off.
+
+### 12. Impossible travel (`--travel`)
+**What:** Successive successful logins by one account from IPs whose locations are more than 100 km apart and would need more than 900 km/h (`--travel-speed`).
+
+**Why it matters:** One person cannot be in London and New York 30 minutes apart; a stolen credential can. VPNs, mobile carriers and corporate proxies cause false alarms, so use it as a prompt to verify. It needs coordinates, so private/reserved addresses are ignored.
+
+### 13. Windows lockouts, web scanners and sudo/su failures
+**What:** Event 4740 lockouts are listed (an account being hammered). Web-server IPs requesting several scanner-only URLs are flagged. Accounts with 3+ failed `sudo`/`su` attempts in the window are flagged.
+
+**Why it matters:** Each is a different angle on the same story: someone probing for a way in, or for root. These sections only appear when the log contains that kind of evidence.
+
 ## About the sample data
 
 `generate_sample_logs.py` builds three days of fake traffic with a fixed random seed, so the results are repeatable. `auth.log` contains:
@@ -209,17 +289,25 @@ python log_analyser.py security.csv
 - Two odd-hour logins by `dave` and `bob`
 - A night-shift worker (`frank`) who always logs in around 2 a.m.
 - Harmless background noise (single failures)
+- A low-and-slow attacker (24 failures over 22 hours against `backup`)
+- A takeover of `erin`: six IPs each guess once, then one gets in
+- One attempt logged three ways, a PAM failure and three failed `sudo` attempts by `bob`
 
-`windows_security.csv` has a brute-force burst on `Administrator` that ends in a successful logon, plus normal logons and one odd-hour logon.
+`windows_security.csv` has a brute-force burst on `Administrator` that ends in a successful logon, an account lockout, normal logons, a local console logon, a service logon (ignored) and one odd-hour logon.
+
+`access.log` has a vulnerability scanner, a Basic-auth password guesser and one normal visitor. Impossible travel needs public IPs, so it is covered by the unit tests rather than the sample data.
 
 All IPs are from reserved documentation ranges (RFC 5737), so none belong to real systems.
 
 ## Limitations and ideas for improvement
 
-- Two log formats only; add parsers for web server logs, firewall logs or the raw `.evtx` format
+- Three log formats; firewall logs and the raw `.evtx` format are not supported, and Windows CSV timestamps must be `yyyy-MM-dd HH:mm:ss`
+- Web logs only yield failures, so there is no compromise or new-IP detection for them; WordPress login detection is a heuristic
+- `--follow` handles one plain-text SSH log; `--geoip-db` is written against the `geoip2` API but is only unit-tested with a stand-in reader, not a real `.mmdb` file
+- Baseline alerts are matched on type, IP, user and start time, so a burst that keeps growing can be reported again when its worst window shifts
 - `--learn` is a simple heuristic and needs a few logins per user; a real system would use longer baselines
-- GeoIP uses one free service; threat-intelligence reputation lookups (e.g. AbuseIPDB) would add context
-- Could also send alerts by email or webhook (JSON, CSV, Markdown and HTML export already exist)
+- Threat-intelligence reputation lookups (e.g. AbuseIPDB) would add context to attacking IPs
+- Sudo/su failures and 4672 "special privileges" events with no IP are not tied to a source, and 4672 is not parsed yet
 
 ## Disclaimer
 

@@ -8,19 +8,39 @@
 2026-10-01 10:26:40 sshd[2535]: Failed password for carol from 198.51.100.12 port 44328
 2026-10-01 10:27:00 sshd[4811]: Accepted password for carol from 198.51.100.12 port 63118
 2026-10-01 15:39:00 sshd[2200]: Failed password for erin from 192.0.2.112 port 43969
+2026-10-01 16:20:00 sshd[4001]: Invalid user oracle from 192.0.2.120 port 40001
+2026-10-01 16:20:00 sshd[4001]: Failed password for invalid user oracle from 192.0.2.120 port 40001 ssh2
+2026-10-01 16:20:05 sshd[4001]: Connection closed by authenticating user oracle 192.0.2.120 port 40001 [preauth]
+2026-10-01 16:21:00 sshd[4002]: Failed keyboard-interactive/pam for bob from 192.0.2.121 port 40002 ssh2
 2026-10-01 18:41:00 sshd[6180]: Failed password for carol from 192.0.2.158 port 34754
 2026-10-01 18:52:00 sshd[2697]: Failed password for erin from 192.0.2.138 port 38800
+2026-10-02 01:00:00 sshd[4335]: Failed password for backup from 203.0.113.88 port 47300
 2026-10-02 01:15:00 sshd[9565]: Accepted password for bob from 198.51.100.11 port 50733
+2026-10-02 01:55:00 sshd[9280]: Failed password for backup from 203.0.113.88 port 62016
 2026-10-02 02:35:00 sshd[3546]: Accepted password for frank from 198.51.100.15 port 47848
+2026-10-02 02:50:00 sshd[5114]: Failed password for backup from 203.0.113.88 port 33329
+2026-10-02 03:45:00 sshd[2512]: Failed password for backup from 203.0.113.88 port 57759
+2026-10-02 04:40:00 sshd[5533]: Failed password for backup from 203.0.113.88 port 32889
+2026-10-02 05:35:00 sshd[1058]: Failed password for backup from 203.0.113.88 port 51859
+2026-10-02 06:30:00 sshd[3143]: Failed password for backup from 203.0.113.88 port 47167
+2026-10-02 07:25:00 sshd[3647]: Failed password for backup from 203.0.113.88 port 58956
+2026-10-02 08:20:00 sshd[8007]: Failed password for backup from 203.0.113.88 port 30633
 2026-10-02 08:34:40 sshd[6925]: Failed password for dave from 198.51.100.13 port 42601
 2026-10-02 08:35:00 sshd[2139]: Accepted password for dave from 198.51.100.13 port 33003
 2026-10-02 08:46:00 sshd[3045]: Accepted password for carol from 198.51.100.12 port 54807
 2026-10-02 09:05:40 sshd[2584]: Failed password for bob from 198.51.100.11 port 53526
 2026-10-02 09:06:00 sshd[6635]: Accepted password for bob from 198.51.100.11 port 47335
+2026-10-02 09:15:00 sshd[2832]: Failed password for backup from 203.0.113.88 port 34931
+2026-10-02 10:10:00 sshd[3442]: Failed password for backup from 203.0.113.88 port 32361
 2026-10-02 10:14:00 sshd[2307]: Accepted password for erin from 198.51.100.14 port 45256
 2026-10-02 10:27:00 sshd[3547]: Accepted password for alice from 198.51.100.10 port 44110
 2026-10-02 10:28:00 sshd[5956]: Failed password for erin from 192.0.2.190 port 64664
+2026-10-02 11:00:00 sudo: bob : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/bob ; USER=root ; COMMAND=/bin/bash
+2026-10-02 11:05:00 sshd[7049]: Failed password for backup from 203.0.113.88 port 39705
 2026-10-02 11:42:00 sshd[5351]: Failed password for carol from 192.0.2.130 port 55938
+2026-10-02 12:00:00 sshd[8041]: Failed password for backup from 203.0.113.88 port 38352
+2026-10-02 12:55:00 sshd[1685]: Failed password for backup from 203.0.113.88 port 50202
+2026-10-02 13:50:00 sshd[6974]: Failed password for backup from 203.0.113.88 port 32614
 2026-10-02 14:05:00 sshd[3340]: Failed password for root from 203.0.113.45 port 47359
 2026-10-02 14:05:03 sshd[5040]: Failed password for admin from 203.0.113.45 port 47219
 2026-10-02 14:05:06 sshd[7543]: Failed password for root from 203.0.113.45 port 53723
@@ -61,6 +81,15 @@
 2026-10-02 14:06:51 sshd[7596]: Failed password for admin from 203.0.113.45 port 52236
 2026-10-02 14:06:54 sshd[5073]: Failed password for admin from 203.0.113.45 port 42556
 2026-10-02 14:06:57 sshd[9786]: Failed password for admin from 203.0.113.45 port 59400
+2026-10-02 14:45:00 sshd[6862]: Failed password for backup from 203.0.113.88 port 43767
+2026-10-02 15:40:00 sshd[5088]: Failed password for backup from 203.0.113.88 port 36736
+2026-10-02 16:35:00 sshd[6794]: Failed password for backup from 203.0.113.88 port 56632
+2026-10-02 17:30:00 sshd[3532]: Failed password for backup from 203.0.113.88 port 45514
+2026-10-02 18:25:00 sshd[3662]: Failed password for backup from 203.0.113.88 port 41603
+2026-10-02 19:20:00 sshd[7755]: Failed password for backup from 203.0.113.88 port 31624
+2026-10-02 20:15:00 sshd[3938]: Failed password for backup from 203.0.113.88 port 51770
+2026-10-02 21:10:00 sshd[7745]: Failed password for backup from 203.0.113.88 port 46263
+2026-10-02 22:05:00 sshd[5371]: Failed password for backup from 203.0.113.88 port 40433
 2026-10-03 02:18:00 sshd[4450]: Accepted password for frank from 198.51.100.15 port 52471
 2026-10-03 02:30:00 sshd[7912]: Failed password for oracle from 203.0.113.77 port 42025
 2026-10-03 02:30:20 sshd[8579]: Failed password for ubuntu from 203.0.113.77 port 46371
@@ -91,4 +120,11 @@
 2026-10-03 08:42:00 sshd[9751]: Accepted password for bob from 198.51.100.11 port 46043
 2026-10-03 09:03:40 sshd[6155]: Failed password for erin from 198.51.100.14 port 43934
 2026-10-03 09:04:00 sshd[9179]: Accepted password for erin from 198.51.100.14 port 55928
+2026-10-03 11:03:00 sshd[2771]: Failed password for erin from 192.0.2.150 port 55070
+2026-10-03 11:03:20 sshd[1634]: Failed password for erin from 192.0.2.151 port 60847
+2026-10-03 11:03:40 sshd[4644]: Failed password for erin from 192.0.2.152 port 43079
+2026-10-03 11:04:00 sshd[8541]: Failed password for erin from 192.0.2.153 port 52915
+2026-10-03 11:04:20 sshd[6000]: Failed password for erin from 192.0.2.154 port 44915
+2026-10-03 11:04:40 sshd[4652]: Failed password for erin from 192.0.2.155 port 31550
+2026-10-03 11:05:20 sshd[4164]: Accepted password for erin from 192.0.2.156 port 56113
 2026-10-03 12:08:00 sshd[5002]: Failed password for carol from 192.0.2.108 port 54217

@@ -1,7 +1,7 @@
 """Generate realistic sample login logs for testing log_analyser.py.
 
 Run:  python generate_sample_logs.py
-Output: sample_logs/auth.log
+Output: sample_logs/auth.log, sample_logs/windows_security.csv, sample_logs/access.log
 
 The log uses the same shape as a simplified SSH auth log:
     2026-10-01 03:12:44 sshd[1234]: Failed password for admin from 203.0.113.45 port 51234
@@ -77,6 +77,32 @@ for _ in range(6):
 for day in range(3):
     add(START + timedelta(days=day, hours=2, minutes=random.randint(0, 40)), "Accepted", "frank", "198.51.100.15")
 
+# 8. Low and slow: one IP fails once every ~55 minutes - far too slow for the 5-minute brute-force rule.
+slow_ip = "203.0.113.88"
+for i in range(24):
+    add(START + timedelta(days=1, hours=1, minutes=i * 55), "Failed", "backup", slow_ip)
+
+# 9. Account takeover without a loud IP: erin's password is tried once each from six addresses,
+#    then one of them gets in. No single IP trips the brute-force rule.
+t = START + timedelta(days=2, hours=11, minutes=3)
+for i in range(6):
+    add(t + timedelta(seconds=i * 20), "Failed", "erin", f"192.0.2.{150 + i}")
+add(t + timedelta(seconds=140), "Accepted", "erin", "192.0.2.156")
+
+
+# 10. Other line types real sshd/sudo write: the same attempt logged twice (counted once),
+#     PAM keyboard-interactive failures, and a user who failed sudo three times.
+def raw(when, text):
+    lines.append((when, f"{when:%Y-%m-%d %H:%M:%S} {text}"))
+
+
+t = START + timedelta(days=0, hours=16, minutes=20)
+raw(t, "sshd[4001]: Invalid user oracle from 192.0.2.120 port 40001")
+raw(t, "sshd[4001]: Failed password for invalid user oracle from 192.0.2.120 port 40001 ssh2")
+raw(t + timedelta(seconds=5), "sshd[4001]: Connection closed by authenticating user oracle 192.0.2.120 port 40001 [preauth]")
+raw(t + timedelta(minutes=1), "sshd[4002]: Failed keyboard-interactive/pam for bob from 192.0.2.121 port 40002 ssh2")
+raw(START + timedelta(days=1, hours=11), "sudo: bob : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/bob ; USER=root ; COMMAND=/bin/bash")
+
 # Sort by time, then write the file.
 lines.sort(key=lambda pair: pair[0])
 os.makedirs("sample_logs", exist_ok=True)
@@ -91,8 +117,8 @@ print(f"Wrote {len(lines)} log lines to sample_logs/auth.log")
 win_rows = []
 
 
-def add_win(when, event_id, user, ip):
-    win_rows.append((when, event_id, user, ip))
+def add_win(when, event_id, user, ip, logon_type="3"):
+    win_rows.append((when, event_id, user, ip, logon_type))
 
 
 t = START + timedelta(days=1, hours=10, minutes=20)
@@ -104,9 +130,36 @@ for user in ["alice", "bob"]:  # ordinary logins
         add_win(START + timedelta(days=day, hours=9, minutes=random.randint(0, 40)), 4624, user, "198.51.100.20")
 add_win(START + timedelta(days=2, hours=4, minutes=5), 4624, "bob", "198.51.100.20")  # odd hour
 
+# A lockout (4740), a local console logon (no IP) and a service logon (type 5, ignored by the analyser).
+add_win(START + timedelta(days=1, hours=10, minutes=22), 4740, "Administrator", "", "")
+add_win(START + timedelta(days=1, hours=8, minutes=0), 4624, "alice", "-", "2")
+add_win(START + timedelta(days=1, hours=8, minutes=1), 4624, "SYSTEM", "-", "5")
+
 win_rows.sort()
 with open("sample_logs/windows_security.csv", "w", encoding="utf-8", newline="") as f:
-    f.write("TimeCreated,EventId,TargetUserName,IpAddress\n")
-    for when, event_id, user, ip in win_rows:
-        f.write(f"{when:%Y-%m-%d %H:%M:%S},{event_id},{user},{ip}\n")
+    f.write("TimeCreated,EventId,TargetUserName,IpAddress,LogonType\n")
+    for when, event_id, user, ip, logon_type in win_rows:
+        f.write(f"{when:%Y-%m-%d %H:%M:%S},{event_id},{user},{ip},{logon_type}\n")
 print(f"Wrote {len(win_rows)} events to sample_logs/windows_security.csv")
+
+# ------------------------------------------------------------ web server sample
+# An nginx "combined" access log: a vulnerability scanner, a Basic-auth guesser and a normal visitor.
+web_lines = []
+
+
+def add_web(when, ip, path, status, user="-", method="GET"):
+    web_lines.append((when, f'{ip} - {user} [{when:%d/%b/%Y:%H:%M:%S} +0000] "{method} {path} HTTP/1.1" {status} 512 "-" "Mozilla/5.0"'))
+
+
+t = START + timedelta(days=1, hours=5)
+for i, path in enumerate(["/.env", "/wp-login.php", "/phpmyadmin/", "/.git/config", "/xmlrpc.php", "/server-status"]):
+    add_web(t + timedelta(seconds=i * 2), "203.0.113.99", path, 404)
+for i in range(12):  # guessing the Basic-auth password on /admin
+    add_web(t + timedelta(hours=3, seconds=i * 5), "203.0.113.100", "/admin/", 401, user="admin")
+for i in range(5):  # an ordinary visitor
+    add_web(t + timedelta(hours=4, minutes=i * 7), "198.51.100.30", "/index.html", 200)
+
+web_lines.sort(key=lambda pair: pair[0])
+with open("sample_logs/access.log", "w", encoding="utf-8") as f:
+    f.write("\n".join(text for _, text in web_lines) + "\n")
+print(f"Wrote {len(web_lines)} requests to sample_logs/access.log")
